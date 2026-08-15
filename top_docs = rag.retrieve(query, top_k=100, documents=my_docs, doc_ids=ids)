@@ -1,0 +1,4 @@
+
+In a real deployment, the `RTScene` would be instantiated via NVIDIA OptiX,
+and `candidate_generation` would be replaced by a custom CUDA hit shader
+that performs atomic max accumulation directly on the GPU.
