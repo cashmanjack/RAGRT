@@ -1,54 +1,23 @@
 #include <optix.h>
 #include <optix_function_table.h>
 #include <optix_stubs.h>
+// FIX: required exactly once, in exactly one .cpp file, to define the
+// symbols optix_stubs.h declares. Missing this causes an "undefined
+// reference" LINKER error, not a compile error -- easy to lose time on
+// if you don't know to look for it.
+#include <optix_function_table_definition.h>
+
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cmath>
-#include <algorithm>
+
+#include "optix_rag_shared.h"
 
 // ---------------------------------------------------------------------
-// Test constants
-// ---------------------------------------------------------------------
-constexpr int M             = 2;                  // 2D subspaces
-constexpr int NUM_SUBSPACES = 2;                 // D = 4 in this test
-constexpr int NUM_CENTROIDS = 5;                 // 5 centroids per subspace
-constexpr int NUM_SPHERES   = NUM_CENTROIDS * NUM_SUBSPACES;
-constexpr int MAX_HITS      = NUM_CENTROIDS;     // one ray only hits its own subspace
-constexpr float RADIUS      = 1.0f;              // L2 threshold for now
-
-// ---------------------------------------------------------------------
-// CPU/GPU data definitions
-// ---------------------------------------------------------------------
-struct SphereSpec {
-    float x, y;
-    int subspace_id;
-};
-
-struct alignas(16) RayPayload {
-    int subspace_id;
-    int hit_count;
-    float hit_ts[MAX_HITS];
-};
-
-struct alignas(16) HitSbtData {
-    float3 center;
-    float  radius;
-    int    subspace_id;
-};
-
-struct LaunchParams {
-    float2* query_subspaces;
-    float*  distances;                 // NUM_SUBSPACES * MAX_HITS floats
-    int*    counts;                    // NUM_SUBSPACES ints
-    OptixTraversableHandle gas_handle;
-};
-
-// ---------------------------------------------------------------------
-// Hardcoded test data
+// Hardcoded test data -- must match validate_optix_rag.py exactly
 // ---------------------------------------------------------------------
 static SphereSpec h_spheres[NUM_SPHERES] = {
     // subspace 0
@@ -57,7 +26,6 @@ static SphereSpec h_spheres[NUM_SPHERES] = {
     {-0.5f,  0.5f, 0},
     { 0.5f, -0.5f, 0},
     { 1.5f,  0.0f, 0},
-
     // subspace 1
     { 0.0f,  0.0f, 1},
     {-0.5f, -0.5f, 1},
@@ -70,92 +38,6 @@ static float2 h_query_subspaces[NUM_SUBSPACES] = {
     {0.2f, 0.1f},
     {-0.2f, -0.2f},
 };
-
-// ---------------------------------------------------------------------
-// Device programs
-// ---------------------------------------------------------------------
-extern "C" __global__ void __raygen__query() {
-    uint3 idx = optixGetLaunchIndex();
-    int s = idx.x;
-    if (s >= NUM_SUBSPACES) return;
-
-    LaunchParams* lp = (LaunchParams*)optixGetLaunchParams();
-
-    RayPayload payload;
-    payload.subspace_id = s;
-    payload.hit_count = 0;
-    for (int i = 0; i < MAX_HITS; ++i) payload.hit_ts[i] = 0.0f;
-
-    float2 q = lp->query_subspaces[s];
-    float3 origin = make_float3(q.x, q.y, 2.0f * s);
-    float3 dir    = make_float3(0.0f, 0.0f, 1.0f);
-
-    optixTrace(
-        lp->gas_handle,
-        origin,
-        dir,
-        0.0f,            // tmin: include exact centroid hit
-        1e20f,           // tmax
-        0.0f,
-        OptixVisibilityMask(1),
-        OPTIX_RAY_FLAG_NONE,
-        0,               // SBT offset
-        0,               // SBT stride
-        0,               // miss SBT index
-        payload);
-
-    for (int i = 0; i < payload.hit_count; ++i) {
-        float t = payload.hit_ts[i];
-        // JUNO L2 reconstruction: do NOT read sphere center here.
-        float d = sqrtf(fmaxf(0.0f, RADIUS * RADIUS - (1.0f - t) * (1.0f - t)));
-        lp->distances[s * MAX_HITS + i] = d;
-    }
-    lp->counts[s] = payload.hit_count;
-}
-
-extern "C" __global__ void __intersection__sphere() {
-    HitSbtData* sbt = (HitSbtData*)optixGetSbtDataPointer();
-
-    float3 origin = optixGetObjectRayOrigin();
-    float3 dir    = optixGetObjectRayDirection();
-    float3 center = sbt->center;
-    float  R      = sbt->radius;
-
-    float3 oc = origin - center;
-    float a = dot(dir, dir);
-    float b = 2.0f * dot(oc, dir);
-    float c = dot(oc, oc) - R * R;
-
-    float disc = b * b - 4.0f * a * c;
-    if (disc < 0.0f) return;
-
-    float sqrt_disc = sqrtf(disc);
-    float t0 = (-b - sqrt_disc) / (2.0f * a);
-    float t1 = (-b + sqrt_disc) / (2.0f * a);
-
-    float t = (t0 >= 0.0f) ? t0 : ((t1 >= 0.0f) ? t1 : -1.0f);
-    if (t < 0.0f || t > optixGetRayTmax()) return;
-
-    optixReportIntersection(t, 0);
-}
-
-extern "C" __global__ void __anyhit__record_hits() {
-    RayPayload* payload = (RayPayload*)optixGetPayloadPointer();
-    HitSbtData* sbt = (HitSbtData*)optixGetSbtDataPointer();
-
-    // Only accept spheres in the ray's own JUNO subspace.
-    if (sbt->subspace_id != payload->subspace_id) {
-        optixIgnoreIntersection();
-        return;
-    }
-
-    if (payload->hit_count < MAX_HITS) {
-        payload->hit_ts[payload->hit_count] = optixGetRayTmax();
-        payload->hit_count++;
-    }
-}
-
-extern "C" __global__ void __miss__ms() {}
 
 // ---------------------------------------------------------------------
 // Host helpers
@@ -180,8 +62,7 @@ extern "C" __global__ void __miss__ms() {}
         }                                                                       \
     } while (0)
 
-static void context_log_cb(unsigned int /*level*/, const char* /*tag*/,
-                           const char* message, void* /*cbdata*/) {
+static void context_log_cb(unsigned int, const char*, const char* message, void*) {
     fprintf(stderr, "[OptiX] %s\n", message);
 }
 
@@ -192,16 +73,12 @@ static bool loadPTX(const char* filename, std::vector<char>& buffer) {
     long size = ftell(fp);
     fseek(fp, 0, SEEK_SET);
     buffer.resize(size + 1);
-    if (fread(buffer.data(), 1, size, fp) != (size_t)size) {
-        fclose(fp);
-        return false;
-    }
+    if (fread(buffer.data(), 1, size, fp) != (size_t)size) { fclose(fp); return false; }
     buffer[size] = '\0';
     fclose(fp);
     return true;
 }
 
-// SBT record wrappers
 template<typename T>
 struct SbtRecord {
     alignas(OPTIX_SBT_RECORD_HEADER_SIZE) char header[OPTIX_SBT_RECORD_HEADER_SIZE];
@@ -214,29 +91,22 @@ typedef SbtRecord<RayGenData> RayGenSbtRecord;
 typedef SbtRecord<MissData>   MissSbtRecord;
 typedef SbtRecord<HitSbtData> HitSbtRecord;
 
-// ---------------------------------------------------------------------
-// Scene / pipeline construction
-// ---------------------------------------------------------------------
 static OptixTraversableHandle createGAS(OptixDeviceContext context,
                                         std::vector<OptixAabb>& aabbs) {
-    // Device AABB buffer
     OptixAabb* d_aabb = nullptr;
     CUDA_CHECK(cudaMalloc(&d_aabb, aabbs.size() * sizeof(OptixAabb)));
     CUDA_CHECK(cudaMemcpy(d_aabb, aabbs.data(), aabbs.size() * sizeof(OptixAabb),
                           cudaMemcpyHostToDevice));
 
-    // SBT index offset buffer : 0,1,2,...,NUM_SPHERES-1
     std::vector<uint32_t> sbt_offsets(NUM_SPHERES);
     for (int i = 0; i < NUM_SPHERES; ++i) sbt_offsets[i] = i;
     uint32_t* d_sbt_offsets = nullptr;
     CUDA_CHECK(cudaMalloc(&d_sbt_offsets, sbt_offsets.size() * sizeof(uint32_t)));
     CUDA_CHECK(cudaMemcpy(d_sbt_offsets, sbt_offsets.data(),
-                          sbt_offsets.size() * sizeof(uint32_t),
-                          cudaMemcpyHostToDevice));
+                          sbt_offsets.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
 
     OptixTraversableHandle gas_handle;
 
-    // Build input
     OptixBuildInput build_input = {};
     build_input.type = OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES;
     build_input.customPrimitiveArray.numAabbs = (unsigned int)aabbs.size();
@@ -249,23 +119,19 @@ static OptixTraversableHandle createGAS(OptixDeviceContext context,
     build_input.customPrimitiveArray.sbtIndexOffsetSizeInBytes = sizeof(uint32_t);
     build_input.customPrimitiveArray.sbtIndexOffsetStrideInBytes = sizeof(uint32_t);
 
-    // Accel options
     OptixAccelBuildOptions accel_options = {};
     accel_options.buildFlags = OPTIX_BUILD_FLAG_NONE;
     accel_options.operation = OPTIX_BUILD_OPERATION_BUILD;
 
-    // Query memory requirements
     OptixAccelBufferSizes buffer_sizes;
     OPTIX_CHECK(optixAccelComputeMemoryUsage(context, &accel_options, &build_input, 1,
                                              &buffer_sizes));
 
-    // Allocate temporary and output buffers
     void* d_temp_buffer = nullptr;
     CUDA_CHECK(cudaMalloc(&d_temp_buffer, buffer_sizes.tempSizeInBytes));
     void* d_output_buffer = nullptr;
     CUDA_CHECK(cudaMalloc(&d_output_buffer, buffer_sizes.outputSizeInBytes));
 
-    // Build
     OPTIX_CHECK(optixAccelBuild(context, nullptr, &accel_options, &build_input, 1,
                                 d_temp_buffer, buffer_sizes.tempSizeInBytes,
                                 d_output_buffer, buffer_sizes.outputSizeInBytes,
@@ -283,17 +149,14 @@ static void buildHitSbtData(std::vector<HitSbtData>& hit_data) {
     for (int i = 0; i < NUM_SPHERES; ++i) {
         const SphereSpec& s = h_spheres[i];
         HitSbtData d;
-        d.center   = make_float3(s.x, s.y, 2.0f * s.subspace_id + 1.0f);
-        d.radius   = RADIUS;
+        d.center      = make_float3(s.x, s.y, 2.0f * s.subspace_id + 1.0f);
+        d.radius      = RADIUS;
         d.subspace_id = s.subspace_id;
         hit_data.push_back(d);
     }
 }
 
 int main() {
-    // ------------------------------------------------------------------
-    // 1. Initialize CUDA and OptiX
-    // ------------------------------------------------------------------
     CUDA_CHECK(cudaFree(0));
 
     OptixDeviceContext context = nullptr;
@@ -307,18 +170,12 @@ int main() {
     cuCtxGetCurrent(&cu_ctx);
     OPTIX_CHECK(optixDeviceContextCreate(cu_ctx, &context_options, &context));
 
-    // ------------------------------------------------------------------
-    // 2. Load PTX (generated from this file's device code)
-    // ------------------------------------------------------------------
     std::vector<char> ptx_buffer;
     if (!loadPTX("optix_rag.ptx", ptx_buffer)) {
         fprintf(stderr, "Failed to load optix_rag.ptx\n");
         return 1;
     }
 
-    // ------------------------------------------------------------------
-    // 3. Create module
-    // ------------------------------------------------------------------
     OptixModule module = nullptr;
     char log[2048];
     size_t log_size = sizeof(log);
@@ -330,23 +187,17 @@ int main() {
     OptixPipelineCompileOptions pipeline_compile_options = {};
     pipeline_compile_options.usesMotionBlur = false;
     pipeline_compile_options.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
-    pipeline_compile_options.numPayloadValues = 2 + MAX_HITS;         // subspace_id, hit_count, hit_ts[5] -> 7
-    pipeline_compile_options.numAttributeValues = 2;                  // barycentrics
+    // FIX: was 2 + MAX_HITS (7). Now just 2 -- a packed pointer to the
+    // RayPayload struct, not the struct's contents spread across registers.
+    pipeline_compile_options.numPayloadValues = 2;
+    pipeline_compile_options.numAttributeValues = 0;   // no attributes reported/read
     pipeline_compile_options.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
     pipeline_compile_options.pipelineLaunchParamsVariableName = "params";
 
-    OPTIX_CHECK(optixModuleCreate(context,
-                                  &module_compile_options,
-                                  &pipeline_compile_options,
-                                  ptx_buffer.data(),
-                                  ptx_buffer.size(),
-                                  log,
-                                  &log_size,
-                                  &module));
+    OPTIX_CHECK(optixModuleCreate(context, &module_compile_options,
+                                  &pipeline_compile_options, ptx_buffer.data(),
+                                  ptx_buffer.size(), log, &log_size, &module));
 
-    // ------------------------------------------------------------------
-    // 4. Program groups
-    // ------------------------------------------------------------------
     OptixProgramGroupOptions program_group_options = {};
     char log2[2048];
     size_t log_size2 = sizeof(log2);
@@ -379,27 +230,15 @@ int main() {
     OPTIX_CHECK(optixProgramGroupCreate(context, &hit_desc, 1, &program_group_options,
                                         log2, &log_size2, &hit_group));
 
-    // ------------------------------------------------------------------
-    // 5. Pipeline
-    // ------------------------------------------------------------------
     OptixPipeline pipeline = nullptr;
     OptixPipelineLinkOptions pipeline_link_options = {};
     pipeline_link_options.maxTraceDepth = 1;
 
     OptixProgramGroup program_groups[] = { raygen_group, miss_group, hit_group };
-    OPTIX_CHECK(optixPipelineCreate(context,
-                                    &pipeline_compile_options,
-                                    &pipeline_link_options,
-                                    program_groups,
-                                    3,
-                                    log,
-                                    &log_size,
-                                    &pipeline));
+    OPTIX_CHECK(optixPipelineCreate(context, &pipeline_compile_options,
+                                    &pipeline_link_options, program_groups, 3,
+                                    log, &log_size, &pipeline));
 
-    // ------------------------------------------------------------------
-    // 6. Build GAS from hardcoded spheres
-    // ------------------------------------------------------------------
-    // Convert spheres to AABBs
     std::vector<OptixAabb> h_aabbs;
     std::vector<HitSbtData> h_hit_data;
     buildHitSbtData(h_hit_data);
@@ -407,39 +246,27 @@ int main() {
     for (int i = 0; i < NUM_SPHERES; ++i) {
         const HitSbtData& s = h_hit_data[i];
         OptixAabb aabb;
-        aabb.minX = s.center.x - s.radius;
-        aabb.minY = s.center.y - s.radius;
-        aabb.minZ = s.center.z - s.radius;
-        aabb.maxX = s.center.x + s.radius;
-        aabb.maxY = s.center.y + s.radius;
-        aabb.maxZ = s.center.z + s.radius;
+        aabb.minX = s.center.x - s.radius; aabb.minY = s.center.y - s.radius; aabb.minZ = s.center.z - s.radius;
+        aabb.maxX = s.center.x + s.radius; aabb.maxY = s.center.y + s.radius; aabb.maxZ = s.center.z + s.radius;
         h_aabbs.push_back(aabb);
     }
 
     OptixTraversableHandle gas_handle = createGAS(context, h_aabbs);
 
-    // ------------------------------------------------------------------
-    // 7. Build SBT
-    // ------------------------------------------------------------------
-    // Raygen record
     RayGenSbtRecord raygen_record;
     memset(&raygen_record, 0, sizeof(raygen_record));
     OPTIX_CHECK(optixSbtRecordPackHeader(raygen_group, &raygen_record));
     RayGenSbtRecord* d_raygen_record = nullptr;
     CUDA_CHECK(cudaMalloc(&d_raygen_record, sizeof(RayGenSbtRecord)));
-    CUDA_CHECK(cudaMemcpy(d_raygen_record, &raygen_record, sizeof(RayGenSbtRecord),
-                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_raygen_record, &raygen_record, sizeof(RayGenSbtRecord), cudaMemcpyHostToDevice));
 
-    // Miss record
     MissSbtRecord miss_record;
     memset(&miss_record, 0, sizeof(miss_record));
     OPTIX_CHECK(optixSbtRecordPackHeader(miss_group, &miss_record));
     MissSbtRecord* d_miss_record = nullptr;
     CUDA_CHECK(cudaMalloc(&d_miss_record, sizeof(MissSbtRecord)));
-    CUDA_CHECK(cudaMemcpy(d_miss_record, &miss_record, sizeof(MissSbtRecord),
-                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_miss_record, &miss_record, sizeof(MissSbtRecord), cudaMemcpyHostToDevice));
 
-    // Hit group records (one per sphere)
     std::vector<HitSbtRecord> hit_records(NUM_SPHERES);
     for (int i = 0; i < NUM_SPHERES; ++i) {
         memset(&hit_records[i], 0, sizeof(HitSbtRecord));
@@ -449,8 +276,7 @@ int main() {
     HitSbtRecord* d_hit_records = nullptr;
     CUDA_CHECK(cudaMalloc(&d_hit_records, hit_records.size() * sizeof(HitSbtRecord)));
     CUDA_CHECK(cudaMemcpy(d_hit_records, hit_records.data(),
-                          hit_records.size() * sizeof(HitSbtRecord),
-                          cudaMemcpyHostToDevice));
+                          hit_records.size() * sizeof(HitSbtRecord), cudaMemcpyHostToDevice));
 
     OptixShaderBindingTable sbt = {};
     sbt.raygenRecord = (CUdeviceptr)d_raygen_record;
@@ -461,13 +287,9 @@ int main() {
     sbt.hitgroupRecordStrideInBytes = sizeof(HitSbtRecord);
     sbt.hitgroupRecordCount = NUM_SPHERES;
 
-    // ------------------------------------------------------------------
-    // 8. Allocate and copy query/distance/count buffers
-    // ------------------------------------------------------------------
     float2* d_query = nullptr;
     CUDA_CHECK(cudaMalloc(&d_query, NUM_SUBSPACES * sizeof(float2)));
-    CUDA_CHECK(cudaMemcpy(d_query, h_query_subspaces, NUM_SUBSPACES * sizeof(float2),
-                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_query, h_query_subspaces, NUM_SUBSPACES * sizeof(float2), cudaMemcpyHostToDevice));
 
     float* d_distances = nullptr;
     CUDA_CHECK(cudaMalloc(&d_distances, NUM_SUBSPACES * MAX_HITS * sizeof(float)));
@@ -477,7 +299,6 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_counts, NUM_SUBSPACES * sizeof(int)));
     CUDA_CHECK(cudaMemset(d_counts, 0, NUM_SUBSPACES * sizeof(int)));
 
-    // Launch parameters
     LaunchParams params = {};
     params.query_subspaces = d_query;
     params.distances = d_distances;
@@ -486,28 +307,16 @@ int main() {
 
     CUdeviceptr d_params = 0;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_params), sizeof(LaunchParams)));
-    CUDA_CHECK(cudaMemcpy((void*)d_params, &params, sizeof(LaunchParams),
-                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy((void*)d_params, &params, sizeof(LaunchParams), cudaMemcpyHostToDevice));
 
-    // ------------------------------------------------------------------
-    // 9. Launch
-    // ------------------------------------------------------------------
     OPTIX_CHECK(optixLaunch(pipeline, nullptr, d_params, sizeof(LaunchParams), &sbt,
                             NUM_SUBSPACES, 1, 1));
-
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // ------------------------------------------------------------------
-    // 10. Copy results back and print
-    // ------------------------------------------------------------------
     std::vector<float> distances(NUM_SUBSPACES * MAX_HITS);
     std::vector<int> counts(NUM_SUBSPACES);
-    CUDA_CHECK(cudaMemcpy(distances.data(), d_distances,
-                          NUM_SUBSPACES * MAX_HITS * sizeof(float),
-                          cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(counts.data(), d_counts,
-                          NUM_SUBSPACES * sizeof(int),
-                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(distances.data(), d_distances, NUM_SUBSPACES * MAX_HITS * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(counts.data(), d_counts, NUM_SUBSPACES * sizeof(int), cudaMemcpyDeviceToHost));
 
     for (int s = 0; s < NUM_SUBSPACES; ++s) {
         printf("subspace %d: hit_count=%d\n", s, counts[s]);
@@ -516,9 +325,6 @@ int main() {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Cleanup (not exhaustive, but sufficient for a test)
-    // ------------------------------------------------------------------
     CUDA_CHECK(cudaFree((void*)d_params));
     CUDA_CHECK(cudaFree(d_query));
     CUDA_CHECK(cudaFree(d_distances));
