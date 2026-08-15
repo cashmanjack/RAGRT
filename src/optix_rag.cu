@@ -28,13 +28,13 @@ struct SphereSpec {
     int subspace_id;
 };
 
-struct __align__(16) RayPayload {
+struct alignas(16) RayPayload {
     int subspace_id;
     int hit_count;
     float hit_ts[MAX_HITS];
 };
 
-struct __align__(16) HitSbtData {
+struct alignas(16) HitSbtData {
     float3 center;
     float  radius;
     int    subspace_id;
@@ -204,7 +204,7 @@ static bool loadPTX(const char* filename, std::vector<char>& buffer) {
 // SBT record wrappers
 template<typename T>
 struct SbtRecord {
-    __align__(OPTIX_SBT_RECORD_HEADER_SIZE) char header[OPTIX_SBT_RECORD_HEADER_SIZE];
+    alignas(OPTIX_SBT_RECORD_HEADER_SIZE) char header[OPTIX_SBT_RECORD_HEADER_SIZE];
     T data;
 };
 
@@ -330,8 +330,7 @@ int main() {
     OptixPipelineCompileOptions pipeline_compile_options = {};
     pipeline_compile_options.usesMotionBlur = false;
     pipeline_compile_options.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
-    pipeline_compile_options.numPayloadValues = 3;                    // subspace_id, hit_count, hit_ts[5] -> 3*4? We'll use 1 payload + 5? Actually payload is a struct, OptiX needs number of payload values. We can set to 1 + MAX_HITS = 6? We'll be generous.
-    pipeline_compile_options.numPayloadValues = 1 + MAX_HITS;         // subspace_id, hit_count, hit_ts[5] -> 7
+    pipeline_compile_options.numPayloadValues = 2 + MAX_HITS;         // subspace_id, hit_count, hit_ts[5] -> 7
     pipeline_compile_options.numAttributeValues = 2;                  // barycentrics
     pipeline_compile_options.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
     pipeline_compile_options.pipelineLaunchParamsVariableName = "params";
@@ -486,7 +485,7 @@ int main() {
     params.gas_handle = gas_handle;
 
     CUdeviceptr d_params = 0;
-    CUDA_CHECK(cudaMalloc(&d_params, sizeof(LaunchParams)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_params), sizeof(LaunchParams)));
     CUDA_CHECK(cudaMemcpy((void*)d_params, &params, sizeof(LaunchParams),
                           cudaMemcpyHostToDevice));
 
