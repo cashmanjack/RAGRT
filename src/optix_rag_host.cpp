@@ -1,10 +1,6 @@
 #include <optix.h>
 #include <optix_function_table.h>
 #include <optix_stubs.h>
-// FIX: required exactly once, in exactly one .cpp file, to define the
-// symbols optix_stubs.h declares. Missing this causes an "undefined
-// reference" LINKER error, not a compile error -- easy to lose time on
-// if you don't know to look for it.
 #include <optix_function_table_definition.h>
 
 #include <cuda_runtime.h>
@@ -109,13 +105,16 @@ static OptixTraversableHandle createGAS(OptixDeviceContext context,
 
     OptixBuildInput build_input = {};
     build_input.type = OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES;
-    build_input.customPrimitiveArray.numAabbs = (unsigned int)aabbs.size();
-    build_input.customPrimitiveArray.aabbBuffers = &d_aabb;
+    build_input.customPrimitiveArray.numPrimitives = (unsigned int)aabbs.size();
+    
+    CUdeviceptr d_aabb_ptr = reinterpret_cast<CUdeviceptr>(d_aabb);
+    build_input.customPrimitiveArray.aabbBuffers = &d_aabb_ptr;
     build_input.customPrimitiveArray.strideInBytes = sizeof(OptixAabb);
+    
     unsigned int flags = OPTIX_GEOMETRY_FLAG_NONE;
     build_input.customPrimitiveArray.flags = &flags;
     build_input.customPrimitiveArray.numSbtRecords = NUM_SPHERES;
-    build_input.customPrimitiveArray.sbtIndexOffsetBuffer = d_sbt_offsets;
+    build_input.customPrimitiveArray.sbtIndexOffsetBuffer = reinterpret_cast<CUdeviceptr>(d_sbt_offsets);
     build_input.customPrimitiveArray.sbtIndexOffsetSizeInBytes = sizeof(uint32_t);
     build_input.customPrimitiveArray.sbtIndexOffsetStrideInBytes = sizeof(uint32_t);
 
@@ -133,8 +132,8 @@ static OptixTraversableHandle createGAS(OptixDeviceContext context,
     CUDA_CHECK(cudaMalloc(&d_output_buffer, buffer_sizes.outputSizeInBytes));
 
     OPTIX_CHECK(optixAccelBuild(context, nullptr, &accel_options, &build_input, 1,
-                                d_temp_buffer, buffer_sizes.tempSizeInBytes,
-                                d_output_buffer, buffer_sizes.outputSizeInBytes,
+                                reinterpret_cast<CUdeviceptr>(d_temp_buffer), buffer_sizes.tempSizeInBytes,
+                                reinterpret_cast<CUdeviceptr>(d_output_buffer), buffer_sizes.outputSizeInBytes,
                                 &gas_handle, nullptr, 0));
 
     CUDA_CHECK(cudaFree(d_aabb));
@@ -182,15 +181,13 @@ int main() {
     OptixModuleCompileOptions module_compile_options = {};
     module_compile_options.maxRegisterCount = OPTIX_COMPILE_DEFAULT_MAX_REGISTER_COUNT;
     module_compile_options.optLevel = OPTIX_COMPILE_OPTIMIZATION_DEFAULT;
-    module_compile_options.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_LINEINFO;
+    module_compile_options.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_MINIMAL;
 
     OptixPipelineCompileOptions pipeline_compile_options = {};
     pipeline_compile_options.usesMotionBlur = false;
     pipeline_compile_options.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
-    // FIX: was 2 + MAX_HITS (7). Now just 2 -- a packed pointer to the
-    // RayPayload struct, not the struct's contents spread across registers.
     pipeline_compile_options.numPayloadValues = 2;
-    pipeline_compile_options.numAttributeValues = 0;   // no attributes reported/read
+    pipeline_compile_options.numAttributeValues = 0; 
     pipeline_compile_options.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
     pipeline_compile_options.pipelineLaunchParamsVariableName = "params";
 

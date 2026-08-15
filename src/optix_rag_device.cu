@@ -5,7 +5,7 @@
 // pipeline_compile_options.pipelineLaunchParamsVariableName = "params"
 // set on the host side. OptiX populates this automatically each launch;
 // no manual optixGetLaunchParams() cast needed.
-extern "C" __constant__ LaunchParams params;
+__constant__ LaunchParams params;
 
 // ---------------------------------------------------------------------
 // Pointer <-> payload-register packing.
@@ -71,6 +71,10 @@ extern "C" __global__ void __raygen__query() {
     params.counts[s] = payload.hit_count;
 }
 
+
+
+
+
 extern "C" __global__ void __intersection__sphere() {
     HitSbtData* sbt = reinterpret_cast<HitSbtData*>(optixGetSbtDataPointer());
 
@@ -79,10 +83,12 @@ extern "C" __global__ void __intersection__sphere() {
     float3 center = sbt->center;
     float  R      = sbt->radius;
 
-    float3 oc = origin - center;
-    float a = dot(dir, dir);
-    float b = 2.0f * dot(oc, dir);
-    float c = dot(oc, oc) - R * R;
+    // Explicit scalar math to avoid relying on external operator overload headers
+    float3 oc = make_float3(origin.x - center.x, origin.y - center.y, origin.z - center.z);
+    
+    float a = dir.x * dir.x + dir.y * dir.y + dir.z * dir.z;
+    float b = 2.0f * (oc.x * dir.x + oc.y * dir.y + oc.z * dir.z);
+    float c = (oc.x * oc.x + oc.y * oc.y + oc.z * oc.z) - R * R;
 
     float disc = b * b - 4.0f * a * c;
     if (disc < 0.0f) return;
@@ -96,6 +102,10 @@ extern "C" __global__ void __intersection__sphere() {
 
     optixReportIntersection(t, 0);
 }
+
+
+
+
 
 extern "C" __global__ void __anyhit__record_hits() {
     RayPayload* payload = getPRD();
