@@ -1,4 +1,4 @@
-# RTRAG: Late‑Interaction Retrieval with RT‑Accelerated Candidate Generation
+# RAGRT: Late‑Interaction Retrieval with RT‑Accelerated Candidate Generation
 
 RTRAG accelerates **ColBERT/PLAID‑style late‑interaction retrieval** by
 offloading the *candidate generation* and *centroid‑based pruning* stages to
