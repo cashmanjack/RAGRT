@@ -17,9 +17,9 @@ QUESTIONS_PATH   = "/home/min/a/cashman3/RTRAG/src/experiments/lotte_science_eva
 
 TOP_K = 100
 K_CANDIDATES = 4096
-N_COARSE = 64
+N_COARSE = 32
 K_EIDS = 16
-PRUNE_TAU = 0.10
+PRUNE_TAU = 0.05
 NUM_QUERIES = 20
 
 sys.path.insert(0, BASE_DIR)
