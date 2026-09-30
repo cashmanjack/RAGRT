@@ -1,0 +1,17 @@
+# Benchmark outputs and images
+*.png
+*.csv
+*.log
+*.sqlite
+*.nsys-rep
+
+# Compiled binaries and extensions
+build/
+*.so
+*.ptx
+*.o
+
+# Backups and temporary files
+*.bak*
+../code_backup_v1/
+../src_256_baseline_20260929/
