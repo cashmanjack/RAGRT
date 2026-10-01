@@ -28,7 +28,7 @@ QRELS_PATH       = "/home/min/a/cashman3/RTRAG/src/experiments/lotte_science_eva
 DRAM_CSV_PATH    = os.path.join(BASE_DIR, "dram_results.csv")
 PARETO_CSV_PATH  = os.path.join(BASE_DIR, "pareto_results_live.csv")
 
-# Baseline Parameters
+# Baseline Parameters (Strict Dominance Champion Config)
 TOP_K            = 100
 K_CANDIDATES     = 4096   # ndocs: candidate pool
 N_COARSE         = 32     # nc: coarse centroids
@@ -109,43 +109,11 @@ def load_dram_results_strict():
 
 
 def get_stage3_pids(ranker, config, Q):
+    """Native PLAID Stage 1-3 candidate generation."""
     with torch.inference_mode():
-        pids, centroid_scores = ranker.retrieve(config, Q)
+        pids, _ = ranker.retrieve(config, Q)
         if isinstance(pids, list):
             pids = torch.tensor(pids, dtype=torch.int32, device='cuda')
-        batch_size = 2 ** 20
-        if centroid_scores is not None:
-            if ranker.use_gpu:
-                centroid_scores = centroid_scores.cuda()
-            idx = centroid_scores.max(-1).values >= config.centroid_score_threshold
-            if ranker.use_gpu:
-                approx_scores = []
-                for i in range(0, ceil(len(pids) / batch_size)):
-                    pids_ = pids[i * batch_size : (i+1) * batch_size]
-                    codes_packed, codes_lengths = ranker.embeddings_strided.lookup_codes(pids_)
-                    idx_ = idx[codes_packed.long()]
-                    pruned_codes_strided = StridedTensor(idx_, codes_lengths, use_gpu=ranker.use_gpu)
-                    pruned_codes_padded, pruned_codes_mask = pruned_codes_strided.as_padded_tensor()
-                    pruned_codes_lengths = (pruned_codes_padded * pruned_codes_mask).sum(dim=1)
-                    codes_packed_ = codes_packed[idx_]
-                    approx_scores_ = centroid_scores[codes_packed_.long()]
-                    if approx_scores_.shape[0] == 0:
-                        approx_scores.append(torch.zeros((len(pids_),), dtype=approx_scores_.dtype).cuda())
-                        continue
-                    approx_scores_strided = StridedTensor(approx_scores_, pruned_codes_lengths, use_gpu=ranker.use_gpu)
-                    approx_scores_padded, approx_scores_mask = approx_scores_strided.as_padded_tensor()
-                    approx_scores_ = colbert_score_reduce(approx_scores_padded, approx_scores_mask, config)
-                    approx_scores.append(approx_scores_)
-                approx_scores = torch.cat(approx_scores, dim=0)
-                if config.ndocs < len(approx_scores):
-                    pids = pids[torch.topk(approx_scores, k=config.ndocs).indices]
-                codes_packed, codes_lengths = ranker.embeddings_strided.lookup_codes(pids)
-                approx_scores = centroid_scores[codes_packed.long()]
-                approx_scores_strided = StridedTensor(approx_scores, codes_lengths, use_gpu=ranker.use_gpu)
-                approx_scores_padded, approx_scores_mask = approx_scores_strided.as_padded_tensor()
-                approx_scores = colbert_score_reduce(approx_scores_padded, approx_scores_mask, config)
-                if config.ndocs // 4 < len(approx_scores):
-                    pids = pids[torch.topk(approx_scores, k=(config.ndocs // 4)).indices]
         return pids
 
 
@@ -261,7 +229,7 @@ def run_standard_benchmark(env):
         ptms_recs.append(recall_at_k(ranked[:TOP_K], qrels[qid], 10))
         ptms_mrrs.append(mrr_at_k(ranked[:TOP_K], qrels[qid], 10))
 
-    print(f"  Benchmarking RAGRT (ndocs={K_CANDIDATES})...", flush=True)
+    print("  Benchmarking RAGRT...", flush=True)
     ragrt_tot, ragrt_recs, ragrt_mrrs = [], [], []
     for i, (qid, _) in enumerate(eval_qs):
         for _ in range(NUM_WARMUP):
@@ -295,17 +263,22 @@ def run_standard_benchmark(env):
     dr_ptms = results['plaid'][3] / results['ptms'][3]
     dr_ragrt = results['plaid'][3] / results['ragrt'][3]
 
-    print("\n" + "=" * 90)
+    print("\n" + "=" * 115)
     print("FIGURE 1: STANDARD BENCHMARK RESULTS")
-    print("=" * 90)
-    print(f"{'Engine':<16} | {'Latency':<10} | {'Speedup':<8} | {'DRAM/Query':<12} | {'Data Reduc':<11} | {'Recall@10':<9} | {'MRR@10':<8}")
-    print("-" * 90)
-    print(f"{'Stock PLAID':<16} | {results['plaid'][0]:6.2f} ms | {'1.0x':<8} | {results['plaid'][3]:7.1f} MB  | {'1.0x':<11} | {results['plaid'][1]:.4f}    | {results['plaid'][2]:.4f}")
-    print(f"{'PLAID+TMS':<16} | {results['ptms'][0]:6.2f} ms | {sp_ptms:5.2f}x  | {results['ptms'][3]:7.1f} MB  | {dr_ptms:5.2f}x       | {results['ptms'][1]:.4f}    | {results['ptms'][2]:.4f}")
-    print(f"{'RAGRT':<16} | {results['ragrt'][0]:6.2f} ms | {sp_ragrt:5.2f}x  | {results['ragrt'][3]:7.1f} MB  | {dr_ragrt:5.2f}x       | {results['ragrt'][1]:.4f}    | {results['ragrt'][2]:.4f}")
-    print("=" * 90 + "\n")
+    print("=" * 115)
+    print(f"{'Engine':<12} | {'Parameters / Configuration':<32} | {'Latency':<9} | {'Speedup':<8} | {'DRAM/Query':<11} | {'Data Reduc':<10} | {'Recall@10':<9} | {'MRR@10':<8}")
+    print("-" * 115)
+    print(f"{'Stock PLAID':<12} | {'ncells=2, ndocs=4k (rescore 1k)':<32} | {results['plaid'][0]:6.2f} ms | {'1.0x':<8} | {results['plaid'][3]:6.1f} MB  | {'1.0x':<10} | {results['plaid'][1]:.4f}    | {results['plaid'][2]:.4f}")
+    print(f"{'PLAID+TMS':<12} | {'ncells=2, ndocs=4k (rescore 1k)':<32} | {results['ptms'][0]:6.2f} ms | {sp_ptms:5.2f}x  | {results['ptms'][3]:6.1f} MB  | {dr_ptms:5.2f}x    | {results['ptms'][1]:.4f}    | {results['ptms'][2]:.4f}")
+    print(f"{'RAGRT':<12} | {'ndocs=4096, eids=16, nc=32':<32} | {results['ragrt'][0]:6.2f} ms | {sp_ragrt:5.2f}x  | {results['ragrt'][3]:6.1f} MB  | {dr_ragrt:5.2f}x    | {results['ragrt'][1]:.4f}    | {results['ragrt'][2]:.4f}")
+    print("=" * 115 + "\n")
 
-    engines = ['Stock PLAID', 'PLAID+TMS', 'RAGRT']
+    # Chart with explicit parameters on X-axis
+    engines = [
+        'Stock PLAID\n(ncells=2, ndocs=4k)',
+        'PLAID+TMS\n(ncells=2, ndocs=4k)',
+        'RAGRT (Champion)\n(ndocs=4k, eids=16, nc=32)'
+    ]
     colors = ['#c0392b', '#e67e22', '#2980b9']
     latencies = [results['plaid'][0], results['ptms'][0], results['ragrt'][0]]
     speedups  = [1.0, sp_ptms, sp_ragrt]
@@ -314,7 +287,9 @@ def run_standard_benchmark(env):
     recalls   = [results['plaid'][1], results['ptms'][1], results['ragrt'][1]]
     mrrs      = [results['plaid'][2], results['ptms'][2], results['ragrt'][2]]
 
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5.5))
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5.8))
+    
+    # 1. Latency
     bars1 = ax1.bar(engines, latencies, color=colors, edgecolor='black', width=0.55)
     ax1.set_ylabel('Latency (ms)')
     ax1.set_title('End-to-End Latency', pad=15)
@@ -323,6 +298,7 @@ def run_standard_benchmark(env):
         ax1.text(b.get_x() + b.get_width()/2, b.get_height() + max(latencies)*0.02,
                  f'{l:.2f} ms ({s:.1f}x)', ha='center', va='bottom', fontsize=9.5, fontweight='bold')
 
+    # 2. DRAM Data Movement
     bars2 = ax2.bar(engines, dram_vals, color=colors, edgecolor='black', width=0.55)
     ax2.set_ylabel('DRAM Traffic (MB / query)')
     ax2.set_title('Memory Movement per Query', pad=15)
@@ -331,6 +307,7 @@ def run_standard_benchmark(env):
         ax2.text(b.get_x() + b.get_width()/2, b.get_height() + max(dram_vals)*0.02,
                  f'{d:.1f} MB ({r:.1f}x)', ha='center', va='bottom', fontsize=9.5, fontweight='bold')
 
+    # 3. Accuracy
     x = np.arange(len(engines)); w = 0.35
     b_r = ax3.bar(x - w/2, recalls, w, label='Recall@10', color='#27ae60', edgecolor='black')
     b_m = ax3.bar(x + w/2, mrrs, w, label='MRR@10', color='#8e44ad', edgecolor='black')
@@ -396,7 +373,7 @@ def run_filtered_benchmark(env):
         ptf_recs.append(recall_at_k(ranked, qrels[qid], 10))
         ptf_mrrs.append(mrr_at_k(ranked, qrels[qid], 10))
 
-    print(f"  Benchmarking RAGRT (ndocs={K_CANDIDATES})...", flush=True)
+    print("  Benchmarking RAGRT...", flush=True)
     rf_lats, rf_recs, rf_mrrs = [], [], []
     for i, (qid, _) in enumerate(eval_qs):
         q_lats = []
@@ -422,17 +399,21 @@ def run_filtered_benchmark(env):
     sp_ptms = results['plaid_f'][0] / results['ptms_f'][0]
     sp_ragrt = results['plaid_f'][0] / results['ragrt_f'][0]
 
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 90)
     print("FIGURE 2: FILTERED BENCHMARK RESULTS")
-    print("=" * 80)
-    print(f"{'Engine':<16} | {'Latency':<10} | {'Speedup':<8} | {'Recall@10':<9} | {'MRR@10':<8}")
-    print("-" * 80)
-    print(f"{'Stock PLAID':<16} | {results['plaid_f'][0]:6.2f} ms | {'1.0x':<8} | {results['plaid_f'][1]:.4f}    | {results['plaid_f'][2]:.4f}")
-    print(f"{'PLAID+TMS':<16} | {results['ptms_f'][0]:6.2f} ms | {sp_ptms:5.2f}x  | {results['ptms_f'][1]:.4f}    | {results['ptms_f'][2]:.4f}")
-    print(f"{'RAGRT':<16} | {results['ragrt_f'][0]:6.2f} ms | {sp_ragrt:5.2f}x  | {results['ragrt_f'][1]:.4f}    | {results['ragrt_f'][2]:.4f}")
-    print("=" * 80 + "\n")
+    print("=" * 90)
+    print(f"{'Engine':<16} | {'Parameters / Configuration':<32} | {'Latency':<9} | {'Speedup':<8} | {'Recall@10':<9} | {'MRR@10':<8}")
+    print("-" * 90)
+    print(f"{'Stock PLAID':<16} | {'ncells=2, ndocs=4k (post-filter)':<32} | {results['plaid_f'][0]:6.2f} ms | {'1.0x':<8} | {results['plaid_f'][1]:.4f}    | {results['plaid_f'][2]:.4f}")
+    print(f"{'PLAID+TMS':<16} | {'ncells=2, ndocs=4k (post-filter)':<32} | {results['ptms_f'][0]:6.2f} ms | {sp_ptms:5.2f}x  | {results['ptms_f'][1]:.4f}    | {results['ptms_f'][2]:.4f}")
+    print(f"{'RAGRT':<16} | {'ndocs=4096, eids=16, nc=32':<32} | {results['ragrt_f'][0]:6.2f} ms | {sp_ragrt:5.2f}x  | {results['ragrt_f'][1]:.4f}    | {results['ragrt_f'][2]:.4f}")
+    print("=" * 90 + "\n")
 
-    engines = ['Stock PLAID', 'PLAID+TMS', 'RAGRT']
+    engines = [
+        'Stock PLAID\n(post-filter)',
+        'PLAID+TMS\n(post-filter)',
+        'RAGRT (Champion)\n(in-engine)'
+    ]
     colors = ['#c0392b', '#e67e22', '#2980b9']
     latencies = [results['plaid_f'][0], results['ptms_f'][0], results['ragrt_f'][0]]
     speedups  = [1.0, sp_ptms, sp_ragrt]
@@ -586,7 +567,11 @@ def run_latency_breakdown(env, std_results):
         bot += val
 
     ax.set_xticks(x_pos)
-    ax.set_xticklabels([f'Stock PLAID\n({plaid_tot:.2f} ms)', f'PLAID+TMS\n({ptms_tot:.2f} ms)', f'RAGRT\n({r_wall_tot:.2f} ms)'])
+    ax.set_xticklabels([
+        'Stock PLAID\n(ncells=2, ndocs=4k)',
+        'PLAID+TMS\n(ncells=2, ndocs=4k)',
+        'RAGRT (Champion)\n(ndocs=4k, eids=16, nc=32)'
+    ])
     ax.set_ylabel('Latency (ms)')
     ax.set_title('Per-Stage Latency Breakdown', pad=20)
     ax.set_ylim(0, max(plaid_tot, ptms_tot) * 1.25)
@@ -617,7 +602,6 @@ def run_pareto_sweep(env, plaid_baseline_lat):
     Q_sub3d_list = env['Q_sub3d_list']; topc_list = env['topc_list']; scores_list = env['scores_list']
 
     all_results = []
-    # Clean ndocs list: 512, 1024, 2048, 4096, 8192, 16384, 32768
     NDOCS_LIST_LOCAL  = [512, 1024, 2048, 4096, 8192, 16384, 32768]
     EIDS_LIST_LOCAL   = [1, 2, 4, 8, 16, 32]
     NCOARSE_LIST      = [16, 32, 64]
@@ -667,7 +651,7 @@ def run_pareto_sweep(env, plaid_baseline_lat):
                     })
 
     # Print Pareto Frontier Tables
-    for mode, lat_key in [('Sequential', 'lat_seq', 'seq'), ('Pipelined', 'lat_pipe', 'pipe')]:
+    for mode, lat_key in [('Sequential', 'lat_seq'), ('Pipelined', 'lat_pipe')]:
         sorted_r = sorted(all_results, key=lambda x: x[lat_key])
         pareto = []
         max_mrr = -1
