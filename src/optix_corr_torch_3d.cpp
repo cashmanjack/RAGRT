@@ -61,10 +61,6 @@ extern "C" void launch_tile_maxsim_fused_decomp(
     float* d_out_scores, cudaStream_t stream
 );
 
-
-
-
-
 extern "C" void launch_ragrt_stage2_only(
     const int* d_out_c, const float* d_out_v, const int* d_out_hit_count,
     const int* d_topc, const float* d_scores,
@@ -80,10 +76,6 @@ extern "C" void launch_ragrt_stage3_only(
     int buf_idx, cudaStream_t stream
 );
 
-
-
-
-
 class CorrIndex3D {
 public:
     OptixDeviceContext ctx = nullptr;
@@ -96,9 +88,6 @@ public:
     std::vector<OptixTraversableHandle> gas_handles;
     std::vector<void*> gas_out_bufs, gas_v_bufs, gas_i_bufs;
     float3* d_centroid_xyz = nullptr;
-    float3* d_super_centroid_xyz = nullptr;
-    float*  d_group_radius = nullptr;
-    int*    d_group_assign = nullptr;
 
     torch::Tensor buf_out_c[2], buf_out_v[2], buf_out_n[2];
     torch::Tensor d_passage_scores[2], d_final_scores[2], d_candidate_pids[2];
@@ -125,9 +114,11 @@ public:
         CUcontext cu=nullptr; cuCtxGetCurrent(&cu); OPTIX_CHECK(optixDeviceContextCreate(cu,&copts,&ctx));
 
         std::vector<char> ptx; TORCH_CHECK(loadPTX(ptx_path, ptx), "failed to load candidate PTX");
-        OptixModuleCompileOptions mco={}; mco.optLevel=OPTIX_COMPILE_OPTIMIZATION_DEFAULT;
+        OptixModuleCompileOptions mco={}; mco.optLevel=OPTIX_COMPILE_OPTIMIZATION_LEVEL_3;
         OptixPipelineCompileOptions pco={}; pco.traversableGraphFlags=OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_ANY;
-        pco.numPayloadValues=1; pco.numAttributeValues=2; pco.pipelineLaunchParamsVariableName="params";
+        pco.numPayloadValues=2; // Payload 0: ray_id, Payload 1: private hit counter (zero atomics!)
+        pco.numAttributeValues=2;
+        pco.pipelineLaunchParamsVariableName="params";
         OPTIX_CHECK(optixModuleCreate(ctx,&mco,&pco,ptx.data(),ptx.size(),nullptr,nullptr,&mod));
 
         OptixProgramGroupOptions gopts={}; OptixProgramGroupDesc d={};
@@ -165,9 +156,6 @@ public:
     ~CorrIndex3D() {
         if (d_p_single) cudaFree(d_p_single);
         if (d_centroid_xyz) cudaFree(d_centroid_xyz);
-        if (d_super_centroid_xyz) cudaFree(d_super_centroid_xyz);
-        if (d_group_radius) cudaFree(d_group_radius);
-        if (d_group_assign) cudaFree(d_group_assign);
         if (stream_cand) cudaStreamDestroy(stream_cand);
         if (stream_score) cudaStreamDestroy(stream_score);
         for (int b = 0; b < 2; ++b) {
@@ -200,7 +188,7 @@ public:
         TORCH_CHECK(num_tris == 4, "build() requires num_tris == 4; got ", num_tris);
         free_scene();
         int S = NUM_3D_SUBSPACES;
-        int E = NUM_FINE_PER_SUBSPACE; // 256
+        int E = NUM_FINE_PER_SUBSPACE;
 
         auto cba = codebooks.accessor<float, 3>();
         std::vector<float3> h_centroid_xyz(S * E);
@@ -265,32 +253,6 @@ public:
         CUDA_CHECK(cudaMemcpy(d_centroid_xyz, h_centroid_xyz.data(), h_centroid_xyz.size() * sizeof(float3), cudaMemcpyHostToDevice));
     }
 
-    void bind_hierarchy(torch::Tensor super_codewords, torch::Tensor group_radius, torch::Tensor group_assign) {
-        int S = NUM_3D_SUBSPACES;
-        int G = NUM_GROUPS_PER_SUBSPACE;
-        auto sc_a = super_codewords.accessor<float, 3>();
-        std::vector<float3> h_sc(S * G);
-        for (int s = 0; s < S; ++s) {
-            for (int g = 0; g < G; ++g) {
-                h_sc[s * G + g] = make_float3(sc_a[s][g][0], sc_a[s][g][1], sc_a[s][g][2]);
-            }
-        }
-        if (d_super_centroid_xyz) cudaFree(d_super_centroid_xyz);
-        if (d_group_radius) cudaFree(d_group_radius);
-        if (d_group_assign) cudaFree(d_group_assign);
-
-        CUDA_CHECK(cudaMalloc(&d_super_centroid_xyz, S * G * sizeof(float3)));
-        CUDA_CHECK(cudaMemcpy(d_super_centroid_xyz, h_sc.data(), S * G * sizeof(float3), cudaMemcpyHostToDevice));
-
-        auto gr_c = group_radius.contiguous().to(torch::kFloat32);
-        CUDA_CHECK(cudaMalloc(&d_group_radius, S * G * sizeof(float)));
-        CUDA_CHECK(cudaMemcpy(d_group_radius, gr_c.data_ptr<float>(), S * G * sizeof(float), cudaMemcpyHostToDevice));
-
-        auto ga_c = group_assign.contiguous().to(torch::kInt32);
-        CUDA_CHECK(cudaMalloc(&d_group_assign, S * NUM_FINE_PER_SUBSPACE * sizeof(int)));
-        CUDA_CHECK(cudaMemcpy(d_group_assign, ga_c.data_ptr<int>(), S * NUM_FINE_PER_SUBSPACE * sizeof(int), cudaMemcpyHostToDevice));
-    }
-
     void bind_index(
         torch::Tensor csr_row_ptrs, torch::Tensor csr_col_eids,
         torch::Tensor csr_offsets, torch::Tensor csr_lengths, torch::Tensor map_packed,
@@ -323,16 +285,12 @@ public:
         is_bound = true;
     }
 
-    // 256 SEQUENTIAL SEARCH WITH ADAPTIVE PRUNING
     torch::Tensor search_single_query_native(
         torch::Tensor Q_full_128_fp32, torch::Tensor Q_full_fp16, torch::Tensor Q_sub3d, torch::Tensor topc, torch::Tensor scores,
-        int k_cent, int k_candidates, int k_top, int maxsim_backend = 0, uint32_t query_mask = 0, int k_eids = 16,
-        int k_prune = 0, float prune_threshold = 0.10f
+        int k_cent, int k_candidates, int k_top, int maxsim_backend = 0, uint32_t query_mask = 0, int k_eids = 16
     ) {
         TORCH_CHECK(is_bound, "Index must be bound before search!");
-        TORCH_CHECK(k_eids >= 1 && k_eids <= 64, "k_eids must be in [1, 64], got ", k_eids);
         int nq = (int)Q_sub3d.size(0);
-        TORCH_CHECK(nq >= 1 && nq <= 32, "RAGRT supports at most 32 query tokens, got ", nq);
         ensure_cand_capacity(k_candidates);
         int total_rays = nq * NUM_3D_SUBSPACES;
         auto qp = Q_sub3d.view({total_rays, 3}).contiguous();
@@ -358,10 +316,6 @@ public:
         p.out_hit_value = buf_out_v[0].data_ptr<float>();
         p.out_hit_count = buf_out_n[0].data_ptr<int>();
         p.max_hits = 128;
-        p.super_centroid_xyz = d_super_centroid_xyz;
-        p.group_radius = d_group_radius;
-        p.group_assign = d_group_assign;
-        p.prune_threshold = prune_threshold;
 
         CUDA_CHECK(cudaMemcpy(d_p_single, &p, sizeof(CorrParams3D), cudaMemcpyHostToDevice));
         OPTIX_CHECK(optixLaunch(pipe, nullptr, (CUdeviceptr)d_p_single, sizeof(CorrParams3D), &sbt, total_rays, 1, 1));
@@ -396,11 +350,96 @@ public:
             );
         }
 
-        auto topk_final = torch::topk(d_final_scores[0].slice(0, 0, k_candidates), k_top);
+        auto topk_final = torch::topk(d_final_scores[0].slice(0, 0, k_candidates), std::min(k_top, k_candidates));
         return candidate_pids.index({std::get<1>(topk_final)});
     }
 
-    // 256 DUAL-STREAM PIPELINED SEARCH
+    std::tuple<torch::Tensor, std::vector<float>> search_single_query_profiled(
+        torch::Tensor Q_full_128_fp32, torch::Tensor Q_full_fp16, torch::Tensor Q_sub3d, torch::Tensor topc, torch::Tensor scores,
+        int k_cent, int k_candidates, int k_top, int maxsim_backend = 0, uint32_t query_mask = 0, int k_eids = 16
+    ) {
+        TORCH_CHECK(is_bound, "Index must be bound before search!");
+        int nq = (int)Q_sub3d.size(0);
+        ensure_cand_capacity(k_candidates);
+        int total_rays = nq * NUM_3D_SUBSPACES;
+        auto qp = Q_sub3d.view({total_rays, 3}).contiguous();
+
+        if (total_rays > buf_total_rays) {
+            auto oi = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+            auto of = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+            for (int b = 0; b < 2; ++b) {
+                buf_out_c[b] = torch::zeros({total_rays, 128}, oi);
+                buf_out_v[b] = torch::zeros({total_rays, 128}, of);
+                buf_out_n[b] = torch::zeros({total_rays}, oi);
+            }
+            buf_total_rays = total_rays;
+        } else {
+            buf_out_c[0].zero_(); buf_out_v[0].zero_(); buf_out_n[0].zero_();
+        }
+
+        CorrParams3D p = {};
+        p.query_points = (float3*)qp.data_ptr<float>();
+        for (int s = 0; s < NUM_3D_SUBSPACES; ++s) p.subspace_gas[s] = gas_handles[s];
+        p.centroid_xyz = d_centroid_xyz;
+        p.out_hit_centroid = buf_out_c[0].data_ptr<int>();
+        p.out_hit_value = buf_out_v[0].data_ptr<float>();
+        p.out_hit_count = buf_out_n[0].data_ptr<int>();
+        p.max_hits = 128;
+
+        cudaEvent_t ev0, ev1, ev2, ev3, ev4;
+        cudaEventCreate(&ev0); cudaEventCreate(&ev1); cudaEventCreate(&ev2);
+        cudaEventCreate(&ev3); cudaEventCreate(&ev4);
+
+        // Stage 1: OptiX Ray Tracing
+        cudaEventRecord(ev0, 0);
+        CUDA_CHECK(cudaMemcpy(d_p_single, &p, sizeof(CorrParams3D), cudaMemcpyHostToDevice));
+        OPTIX_CHECK(optixLaunch(pipe, nullptr, (CUdeviceptr)d_p_single, sizeof(CorrParams3D), &sbt, total_rays, 1, 1));
+        cudaEventRecord(ev1, 0);
+
+        // Stage 2: CSR Gather Tasks
+        launch_ragrt_stage2_only(
+            buf_out_c[0].data_ptr<int>(), buf_out_v[0].data_ptr<float>(), buf_out_n[0].data_ptr<int>(),
+            topc.data_ptr<int>(), scores.data_ptr<float>(),
+            total_rays, 128, k_eids, k_cent, nq, b_num_centroids,
+            b_csr_row_ptrs.data_ptr<int>(), (const uint8_t*)b_csr_col_eids.data_ptr(),
+            b_csr_offsets.data_ptr<int64_t>(), (const uint16_t*)b_csr_lengths.data_ptr(),
+            0, 0
+        );
+        cudaEventRecord(ev2, 0);
+
+        // Stage 3: Cooperative Passage Scoring & Sum Reduction
+        d_passage_scores[0].zero_();
+        launch_ragrt_stage3_only(
+            b_map_packed.data_ptr<uint8_t>(), d_passage_scores[0].data_ptr<float>(), (int)b_num_passages,
+            (const uint32_t*)b_doc_predicates.data_ptr(), query_mask, nq, 0, 0
+        );
+        auto topk_cands = torch::topk(d_passage_scores[0], k_candidates);
+        auto candidate_pids = std::get<1>(topk_cands).to(torch::kInt32).contiguous();
+        cudaEventRecord(ev3, 0);
+
+        // Stage 4: TileMaxSim Rerank
+        launch_tile_maxsim_fused_decomp(
+            Q_full_fp16.data_ptr(), candidate_pids.data_ptr<int>(), b_doc_offsets.data_ptr<int64_t>(), b_doc_lens.data_ptr<int>(),
+            k_candidates, b_codes.data_ptr<int>(), b_residuals.data_ptr<uint8_t>(), b_centroids_128.data_ptr(),
+            b_bucket_weights.data_ptr(), b_reversed_bit_map.data_ptr<uint8_t>(), b_decomp_table.data_ptr<uint8_t>(),
+            d_final_scores[0].data_ptr<float>(), 0
+        );
+        auto topk_final = torch::topk(d_final_scores[0].slice(0, 0, k_candidates), std::min(k_top, k_candidates));
+        cudaEventRecord(ev4, 0);
+
+        cudaEventSynchronize(ev4);
+        float t_s1 = 0, t_s2 = 0, t_s3 = 0, t_s4 = 0;
+        cudaEventElapsedTime(&t_s1, ev0, ev1);
+        cudaEventElapsedTime(&t_s2, ev1, ev2);
+        cudaEventElapsedTime(&t_s3, ev2, ev3);
+        cudaEventElapsedTime(&t_s4, ev3, ev4);
+
+        cudaEventDestroy(ev0); cudaEventDestroy(ev1); cudaEventDestroy(ev2);
+        cudaEventDestroy(ev3); cudaEventDestroy(ev4);
+
+        return std::make_tuple(candidate_pids.index({std::get<1>(topk_final)}), std::vector<float>{t_s1, t_s2, t_s3, t_s4});
+    }
+
     torch::Tensor search_batch_pipelined(
         std::vector<torch::Tensor> Q_full_128_list,
         std::vector<torch::Tensor> Q_full_fp16_list,
@@ -408,8 +447,7 @@ public:
         std::vector<torch::Tensor> topc_list,
         std::vector<torch::Tensor> scores_list,
         int k_cent, int k_candidates, int k_top,
-        int maxsim_backend = 0, uint32_t query_mask = 0, int k_eids = 16, int k_prune = 0,
-        float prune_threshold = 0.10f
+        int maxsim_backend = 0, uint32_t query_mask = 0, int k_eids = 16
     ) {
         TORCH_CHECK(is_bound, "Index must be bound before search!");
         ensure_cand_capacity(k_candidates);
@@ -438,10 +476,6 @@ public:
             h_params_all[i].out_hit_value = buf_out_v[buf_idx].data_ptr<float>();
             h_params_all[i].out_hit_count = buf_out_n[buf_idx].data_ptr<int>();
             h_params_all[i].max_hits = 128;
-            h_params_all[i].super_centroid_xyz = d_super_centroid_xyz;
-            h_params_all[i].group_radius = d_group_radius;
-            h_params_all[i].group_assign = d_group_assign;
-            h_params_all[i].prune_threshold = prune_threshold;
         }
         auto d_params_batch = torch::empty({num_queries * (int64_t)sizeof(CorrParams3D)}, 
             torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
@@ -492,7 +526,7 @@ public:
                     d_final_scores[buf_idx].data_ptr<float>(), stream_score
                 );
 
-                auto topk_final = torch::topk(d_final_scores[buf_idx].slice(0, 0, k_candidates), k_top);
+                auto topk_final = torch::topk(d_final_scores[buf_idx].slice(0, 0, k_candidates), std::min(k_top, k_candidates));
                 auto final_ranked = d_candidate_pids[buf_idx].slice(0, 0, k_candidates).index({std::get<1>(topk_final)});
                 out_results[i].copy_(final_ranked);
                 CUDA_CHECK(cudaEventRecord(event_tms_done[buf_idx], stream_score));
@@ -503,99 +537,6 @@ public:
         CUDA_CHECK(cudaStreamSynchronize(stream_score));
         return out_results;
     }
-
-std::tuple<torch::Tensor, std::vector<float>> search_single_query_profiled(
-        torch::Tensor Q_full_128_fp32, torch::Tensor Q_full_fp16, torch::Tensor Q_sub3d, torch::Tensor topc, torch::Tensor scores,
-        int k_cent, int k_candidates, int k_top, int maxsim_backend = 0, uint32_t query_mask = 0, int k_eids = 16,
-        int k_prune = 0, float prune_threshold = 0.10f
-    ) {
-        TORCH_CHECK(is_bound, "Index must be bound before search!");
-        int nq = (int)Q_sub3d.size(0);
-        ensure_cand_capacity(k_candidates);
-        int total_rays = nq * NUM_3D_SUBSPACES;
-        auto qp = Q_sub3d.view({total_rays, 3}).contiguous();
-
-        if (total_rays > buf_total_rays) {
-            auto oi = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
-            auto of = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-            for (int b = 0; b < 2; ++b) {
-                buf_out_c[b] = torch::zeros({total_rays, 128}, oi);
-                buf_out_v[b] = torch::zeros({total_rays, 128}, of);
-                buf_out_n[b] = torch::zeros({total_rays}, oi);
-            }
-            buf_total_rays = total_rays;
-        } else {
-            buf_out_c[0].zero_(); buf_out_v[0].zero_(); buf_out_n[0].zero_();
-        }
-
-        CorrParams3D p = {};
-        p.query_points = (float3*)qp.data_ptr<float>();
-        for (int s = 0; s < NUM_3D_SUBSPACES; ++s) p.subspace_gas[s] = gas_handles[s];
-        p.centroid_xyz = d_centroid_xyz;
-        p.out_hit_centroid = buf_out_c[0].data_ptr<int>();
-        p.out_hit_value = buf_out_v[0].data_ptr<float>();
-        p.out_hit_count = buf_out_n[0].data_ptr<int>();
-        p.max_hits = 128;
-        p.super_centroid_xyz = d_super_centroid_xyz;
-        p.group_radius = d_group_radius;
-        p.group_assign = d_group_assign;
-        p.prune_threshold = prune_threshold;
-
-        cudaEvent_t ev0, ev1, ev2, ev3, ev4;
-        cudaEventCreate(&ev0); cudaEventCreate(&ev1); cudaEventCreate(&ev2);
-        cudaEventCreate(&ev3); cudaEventCreate(&ev4);
-
-        // Stage 1: OptiX Ray Tracing
-        cudaEventRecord(ev0, 0);
-        CUDA_CHECK(cudaMemcpy(d_p_single, &p, sizeof(CorrParams3D), cudaMemcpyHostToDevice));
-        OPTIX_CHECK(optixLaunch(pipe, nullptr, (CUdeviceptr)d_p_single, sizeof(CorrParams3D), &sbt, total_rays, 1, 1));
-        cudaEventRecord(ev1, 0);
-
-        // Stage 2: CSR Gather Tasks
-        launch_ragrt_stage2_only(
-            buf_out_c[0].data_ptr<int>(), buf_out_v[0].data_ptr<float>(), buf_out_n[0].data_ptr<int>(),
-            topc.data_ptr<int>(), scores.data_ptr<float>(),
-            total_rays, 128, k_eids, k_cent, nq, b_num_centroids,
-            b_csr_row_ptrs.data_ptr<int>(), (const uint8_t*)b_csr_col_eids.data_ptr(),
-            b_csr_offsets.data_ptr<int64_t>(), (const uint16_t*)b_csr_lengths.data_ptr(),
-            0, 0
-        );
-        cudaEventRecord(ev2, 0);
-
-        // Stage 3: Cooperative Passage Scoring & Sum Reduction
-        d_passage_scores[0].zero_();
-        launch_ragrt_stage3_only(
-            b_map_packed.data_ptr<uint8_t>(), d_passage_scores[0].data_ptr<float>(), (int)b_num_passages,
-            (const uint32_t*)b_doc_predicates.data_ptr(), query_mask, nq, 0, 0
-        );
-        auto topk_cands = torch::topk(d_passage_scores[0], k_candidates);
-        auto candidate_pids = std::get<1>(topk_cands).to(torch::kInt32).contiguous();
-        cudaEventRecord(ev3, 0);
-
-        // Stage 4: TileMaxSim Rerank
-        launch_tile_maxsim_fused_decomp(
-            Q_full_fp16.data_ptr(), candidate_pids.data_ptr<int>(), b_doc_offsets.data_ptr<int64_t>(), b_doc_lens.data_ptr<int>(),
-            k_candidates, b_codes.data_ptr<int>(), b_residuals.data_ptr<uint8_t>(), b_centroids_128.data_ptr(),
-            b_bucket_weights.data_ptr(), b_reversed_bit_map.data_ptr<uint8_t>(), b_decomp_table.data_ptr<uint8_t>(),
-            d_final_scores[0].data_ptr<float>(), 0
-        );
-        auto topk_final = torch::topk(d_final_scores[0].slice(0, 0, k_candidates), k_top);
-        cudaEventRecord(ev4, 0);
-
-        cudaEventSynchronize(ev4);
-        float t_s1 = 0, t_s2 = 0, t_s3 = 0, t_s4 = 0;
-        cudaEventElapsedTime(&t_s1, ev0, ev1);
-        cudaEventElapsedTime(&t_s2, ev1, ev2);
-        cudaEventElapsedTime(&t_s3, ev2, ev3);
-        cudaEventElapsedTime(&t_s4, ev3, ev4);
-
-        cudaEventDestroy(ev0); cudaEventDestroy(ev1); cudaEventDestroy(ev2);
-        cudaEventDestroy(ev3); cudaEventDestroy(ev4);
-
-        return std::make_tuple(candidate_pids.index({std::get<1>(topk_final)}), std::vector<float>{t_s1, t_s2, t_s3, t_s4});
-    }
-
-
 };
 
 torch::Tensor native_tile_maxsim_fused_decomp(
@@ -620,16 +561,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     pybind11::class_<CorrIndex3D>(m, "CorrIndex3D")
         .def(pybind11::init<std::string>(), pybind11::arg("ptx_path"))
         .def("build", &CorrIndex3D::build, pybind11::arg("codebooks"), pybind11::arg("base_radius") = 0.95, pybind11::arg("num_tris") = 4)
-        .def("bind_hierarchy", &CorrIndex3D::bind_hierarchy)
         .def("bind_index", &CorrIndex3D::bind_index)
-.def("search_single_query_profiled", &CorrIndex3D::search_single_query_profiled,
+        .def("search_single_query_profiled", &CorrIndex3D::search_single_query_profiled,
              pybind11::arg("Q_full_128_fp32"), pybind11::arg("Q_full_fp16"), pybind11::arg("Q_sub3d"), pybind11::arg("topc"), pybind11::arg("scores"),
-             pybind11::arg("k_cent"), pybind11::arg("k_candidates"), pybind11::arg("k_top"), pybind11::arg("maxsim_backend") = 0, pybind11::arg("query_mask") = 0, pybind11::arg("k_eids") = 16, pybind11::arg("k_prune") = 0, pybind11::arg("prune_threshold") = 0.10f)     
-   .def("search_single_query_native", &CorrIndex3D::search_single_query_native,
+             pybind11::arg("k_cent"), pybind11::arg("k_candidates"), pybind11::arg("k_top"), pybind11::arg("maxsim_backend") = 0, pybind11::arg("query_mask") = 0, pybind11::arg("k_eids") = 16)     
+        .def("search_single_query_native", &CorrIndex3D::search_single_query_native,
              pybind11::arg("Q_full_128_fp32"), pybind11::arg("Q_full_fp16"), pybind11::arg("Q_sub3d"), pybind11::arg("topc"), pybind11::arg("scores"),
-             pybind11::arg("k_cent"), pybind11::arg("k_candidates"), pybind11::arg("k_top"), pybind11::arg("maxsim_backend") = 0, pybind11::arg("query_mask") = 0, pybind11::arg("k_eids") = 16, pybind11::arg("k_prune") = 0, pybind11::arg("prune_threshold") = 0.10f)
+             pybind11::arg("k_cent"), pybind11::arg("k_candidates"), pybind11::arg("k_top"), pybind11::arg("maxsim_backend") = 0, pybind11::arg("query_mask") = 0, pybind11::arg("k_eids") = 16)
         .def("search_batch_pipelined", &CorrIndex3D::search_batch_pipelined,
              pybind11::arg("Q_full_128_list"), pybind11::arg("Q_full_fp16_list"), pybind11::arg("Q_sub3d_list"), pybind11::arg("topc_list"), pybind11::arg("scores_list"),
-             pybind11::arg("k_cent"), pybind11::arg("k_candidates"), pybind11::arg("k_top"), pybind11::arg("maxsim_backend") = 0, pybind11::arg("query_mask") = 0, pybind11::arg("k_eids") = 16, pybind11::arg("k_prune") = 0, pybind11::arg("prune_threshold") = 0.10f);
+             pybind11::arg("k_cent"), pybind11::arg("k_candidates"), pybind11::arg("k_top"), pybind11::arg("maxsim_backend") = 0, pybind11::arg("query_mask") = 0, pybind11::arg("k_eids") = 16);
     m.def("native_tile_maxsim_fused_decomp", &native_tile_maxsim_fused_decomp);
 }

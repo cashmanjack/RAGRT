@@ -1,10 +1,9 @@
 """
-Unified RAGRT Benchmark & Figure Generator - 100% LIVE PROVENANCE
-- Baseline set to Champion Configuration: ndocs=4096, eids=16, tau=0.05, nc=32.
-- Strictly requires live dram_results.csv from measure_dram.py (NO fallbacks).
-- Stage components sum strictly to 100.0% (no median-of-parts divergence).
-- Figure 2 has no unmeasured DRAM guesses (2 panels: Latency & Accuracy).
-- 504 Pareto sweep runs 100% live with verified module-level timing helpers.
+Unified RAGRT Benchmark Suite
+Figure 1: Standard Retrieval Benchmark (Latency, DRAM Movement, Accuracy)
+Figure 2: Filtered Benchmark (Latency, Accuracy)
+Figure 3: Latency Breakdown (S1 RT, S2 Gather, S3 Score, S4 TMS)
+Figure 4: Pareto Sweep & Frontier (ndocs x eids x n_coarse)
 """
 import os, sys, time, csv
 from math import ceil
@@ -29,12 +28,11 @@ QRELS_PATH       = "/home/min/a/cashman3/RTRAG/src/experiments/lotte_science_eva
 DRAM_CSV_PATH    = os.path.join(BASE_DIR, "dram_results.csv")
 PARETO_CSV_PATH  = os.path.join(BASE_DIR, "pareto_results_live.csv")
 
-# CHAMPION CONFIGURATION (Identified via 504-Config Live Pareto Frontier)
+# Baseline Parameters
 TOP_K            = 100
-K_CANDIDATES     = 4096   # ndocs: 4096 candidate pool
-N_COARSE         = 32     # nc: 32 coarse centroids (Champion Config, was 64)
-K_EIDS           = 16     # eids: 16 fine hits per ray
-PRUNE_TAU        = 0.05   # tau: 0.05 AnyHit pruning threshold (Champion Config, was 0.10)
+K_CANDIDATES     = 4096   # ndocs: candidate pool
+N_COARSE         = 32     # nc: coarse centroids
+K_EIDS           = 16     # eids: fine hits per ray
 SCIENCE_MASK     = 1
 NUM_WARMUP       = 3
 NUM_TIMED_RUNS   = 11
@@ -52,7 +50,6 @@ import rtrag_corr_3d
 plt.rcParams['font.size'] = 11
 
 
-# Top-level helper functions (immune to nested closure/scoping bugs)
 def median_lat_seq(fn, warmup=5, timed=15):
     for _ in range(warmup):
         fn()
@@ -93,11 +90,10 @@ def load_qrels(path):
     return qrels
 
 def load_dram_results_strict():
-    """Reads live DRAM profile results. Fails loudly if missing—NO hardcoded fallbacks."""
     if not os.path.exists(DRAM_CSV_PATH):
         raise FileNotFoundError(
             f"FATAL: {DRAM_CSV_PATH} not found!\n"
-            "You must run 'python3 measure_dram.py' first under nsys to collect live hardware metrics."
+            "Run 'python3 measure_dram.py' first under nsys to collect hardware metrics."
         )
     dram = {}
     with open(DRAM_CSV_PATH) as f:
@@ -113,7 +109,6 @@ def load_dram_results_strict():
 
 
 def get_stage3_pids(ranker, config, Q):
-    """Native PLAID Stage 1-3 candidate generation."""
     with torch.inference_mode():
         pids, centroid_scores = ranker.retrieve(config, Q)
         if isinstance(pids, list):
@@ -156,7 +151,7 @@ def get_stage3_pids(ranker, config, Q):
 
 def setup_engines():
     print("=" * 80)
-    print("INITIALIZING ENGINES & INDEXES (CHAMPION CONFIG: nc=32, tau=0.05)")
+    print("INITIALIZING ENGINES")
     print("=" * 80)
     searcher = Searcher(index=INDEX_PATH, collection=COLLECTION_PATH)
     scorer = FastTileMaxSimScorer(searcher)
@@ -166,13 +161,8 @@ def setup_engines():
     searcher.config.ndocs = K_CANDIDATES
 
     cb = np.load(os.path.join(SPARSE_CSR_DIR, "codebooks.npy"))
-    sc = np.load(os.path.join(SPARSE_CSR_DIR, "super_codewords.npy"))
-    gr = np.load(os.path.join(SPARSE_CSR_DIR, "group_radius.npy"))
-    ga = np.load(os.path.join(SPARSE_CSR_DIR, "group_assign.npy"))
-
     unified_idx = rtrag_corr_3d.CorrIndex3D(PTX_PATH)
     unified_idx.build(torch.tensor(cb, dtype=torch.float32).contiguous(), 0.95, 4)
-    unified_idx.bind_hierarchy(torch.tensor(sc).float(), torch.tensor(gr).float(), torch.tensor(ga).int())
 
     csr_row_ptrs = torch.from_numpy(np.load(os.path.join(SPARSE_CSR_DIR, "csr_row_ptrs.npy")).astype(np.int32)).cuda()
     csr_col_eids = torch.from_numpy(np.load(os.path.join(SPARSE_CSR_DIR, "csr_col_eids.npy"))).cuda()
@@ -211,7 +201,7 @@ def setup_engines():
         topc_list.append(topc)
         scores_list.append(scores)
 
-    print(f"Setup verified complete (N_COARSE={N_COARSE}, PRUNE_TAU={PRUNE_TAU}).\n", flush=True)
+    print(f"Setup complete (nc={N_COARSE}, ndocs={K_CANDIDATES}).\n", flush=True)
     return {
         'searcher': searcher, 'scorer': scorer, 'N': N,
         'unified_idx': unified_idx, 'doc_predicates': doc_predicates,
@@ -224,7 +214,7 @@ def setup_engines():
 
 def run_standard_benchmark(env):
     print("=" * 80)
-    print("RUNNING FIGURE 1: STANDARD RETRIEVAL BENCHMARK")
+    print("FIGURE 1: STANDARD RETRIEVAL BENCHMARK")
     print("=" * 80)
     searcher = env['searcher']; scorer = env['scorer']
     unified_idx = env['unified_idx']; eval_qs = env['eval_qs']; qrels = env['qrels']
@@ -271,13 +261,13 @@ def run_standard_benchmark(env):
         ptms_recs.append(recall_at_k(ranked[:TOP_K], qrels[qid], 10))
         ptms_mrrs.append(mrr_at_k(ranked[:TOP_K], qrels[qid], 10))
 
-    print(f"  Benchmarking RAGRT (Champion Config: nc={N_COARSE}, tau={PRUNE_TAU})...", flush=True)
+    print(f"  Benchmarking RAGRT (ndocs={K_CANDIDATES})...", flush=True)
     ragrt_tot, ragrt_recs, ragrt_mrrs = [], [], []
     for i, (qid, _) in enumerate(eval_qs):
         for _ in range(NUM_WARMUP):
             _ = unified_idx.search_single_query_native(
                 Q_full_128_list[i], Q_full_fp16_list[i], Q_sub3d_list[i], topc_list[i], scores_list[i],
-                N_COARSE, K_CANDIDATES, TOP_K, 0, 0, K_EIDS, 0, PRUNE_TAU)
+                N_COARSE, K_CANDIDATES, TOP_K, 0, 0, K_EIDS)
         torch.cuda.synchronize()
         q_lats = []
         for _ in range(NUM_TIMED_RUNS):
@@ -285,7 +275,7 @@ def run_standard_benchmark(env):
             t0 = time.perf_counter()
             ranked_tensor = unified_idx.search_single_query_native(
                 Q_full_128_list[i], Q_full_fp16_list[i], Q_sub3d_list[i], topc_list[i], scores_list[i],
-                N_COARSE, K_CANDIDATES, TOP_K, 0, 0, K_EIDS, 0, PRUNE_TAU)
+                N_COARSE, K_CANDIDATES, TOP_K, 0, 0, K_EIDS)
             torch.cuda.synchronize()
             q_lats.append((time.perf_counter() - t0) * 1000)
         ragrt_tot.append(float(np.median(q_lats)))
@@ -305,17 +295,16 @@ def run_standard_benchmark(env):
     dr_ptms = results['plaid'][3] / results['ptms'][3]
     dr_ragrt = results['plaid'][3] / results['ragrt'][3]
 
-    print("\n" + "=" * 92)
+    print("\n" + "=" * 90)
     print("FIGURE 1: STANDARD BENCHMARK RESULTS")
-    print("=" * 92)
+    print("=" * 90)
     print(f"{'Engine':<16} | {'Latency':<10} | {'Speedup':<8} | {'DRAM/Query':<12} | {'Data Reduc':<11} | {'Recall@10':<9} | {'MRR@10':<8}")
-    print("-" * 92)
+    print("-" * 90)
     print(f"{'Stock PLAID':<16} | {results['plaid'][0]:6.2f} ms | {'1.0x':<8} | {results['plaid'][3]:7.1f} MB  | {'1.0x':<11} | {results['plaid'][1]:.4f}    | {results['plaid'][2]:.4f}")
     print(f"{'PLAID+TMS':<16} | {results['ptms'][0]:6.2f} ms | {sp_ptms:5.2f}x  | {results['ptms'][3]:7.1f} MB  | {dr_ptms:5.2f}x       | {results['ptms'][1]:.4f}    | {results['ptms'][2]:.4f}")
-    print(f"{'RAGRT (Ours)':<16} | {results['ragrt'][0]:6.2f} ms | {sp_ragrt:5.2f}x  | {results['ragrt'][3]:7.1f} MB  | {dr_ragrt:5.2f}x       | {results['ragrt'][1]:.4f}    | {results['ragrt'][2]:.4f}")
-    print("=" * 92 + "\n")
+    print(f"{'RAGRT':<16} | {results['ragrt'][0]:6.2f} ms | {sp_ragrt:5.2f}x  | {results['ragrt'][3]:7.1f} MB  | {dr_ragrt:5.2f}x       | {results['ragrt'][1]:.4f}    | {results['ragrt'][2]:.4f}")
+    print("=" * 90 + "\n")
 
-    # 3-Panel Plot
     engines = ['Stock PLAID', 'PLAID+TMS', 'RAGRT']
     colors = ['#c0392b', '#e67e22', '#2980b9']
     latencies = [results['plaid'][0], results['ptms'][0], results['ragrt'][0]]
@@ -328,19 +317,19 @@ def run_standard_benchmark(env):
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5.5))
     bars1 = ax1.bar(engines, latencies, color=colors, edgecolor='black', width=0.55)
     ax1.set_ylabel('Latency (ms)')
-    ax1.set_title('End-to-End Latency (Median)', pad=15)
+    ax1.set_title('End-to-End Latency', pad=15)
     ax1.set_ylim(0, max(latencies) * 1.35)
     for b, l, s in zip(bars1, latencies, speedups):
         ax1.text(b.get_x() + b.get_width()/2, b.get_height() + max(latencies)*0.02,
-                 f'{l:.2f} ms\n({s:.1f}x)', ha='center', va='bottom', fontsize=10, fontweight='bold')
+                 f'{l:.2f} ms ({s:.1f}x)', ha='center', va='bottom', fontsize=9.5, fontweight='bold')
 
     bars2 = ax2.bar(engines, dram_vals, color=colors, edgecolor='black', width=0.55)
     ax2.set_ylabel('DRAM Traffic (MB / query)')
-    ax2.set_title('Memory Movement per Query (NSYS Profiler)', pad=15)
+    ax2.set_title('Memory Movement per Query', pad=15)
     ax2.set_ylim(0, max(dram_vals) * 1.35)
     for b, d, r in zip(bars2, dram_vals, dram_red):
         ax2.text(b.get_x() + b.get_width()/2, b.get_height() + max(dram_vals)*0.02,
-                 f'{d:.1f} MB\n({r:.1f}x less)', ha='center', va='bottom', fontsize=10, fontweight='bold')
+                 f'{d:.1f} MB ({r:.1f}x)', ha='center', va='bottom', fontsize=9.5, fontweight='bold')
 
     x = np.arange(len(engines)); w = 0.35
     b_r = ax3.bar(x - w/2, recalls, w, label='Recall@10', color='#27ae60', edgecolor='black')
@@ -362,9 +351,8 @@ def run_standard_benchmark(env):
 
 
 def run_filtered_benchmark(env):
-    """Figure 2: Filtered Benchmark (2 Panels: Latency and Accuracy. Zero scaled DRAM guesses)."""
     print("=" * 80)
-    print("RUNNING FIGURE 2: FILTERED BENCHMARK (14% SELECTIVITY)")
+    print("FIGURE 2: FILTERED BENCHMARK (14% SELECTIVITY)")
     print("=" * 80)
     searcher = env['searcher']; scorer = env['scorer']
     unified_idx = env['unified_idx']; doc_predicates = env['doc_predicates']
@@ -373,7 +361,7 @@ def run_filtered_benchmark(env):
     Q_full_fp16_list = env['Q_full_fp16_list']; Q_sub3d_list = env['Q_sub3d_list']
     topc_list = env['topc_list']; scores_list = env['scores_list']
 
-    print("  Stock PLAID post-filter...", flush=True)
+    print("  Benchmarking Stock PLAID...", flush=True)
     pf_lats, pf_recs, pf_mrrs = [], [], []
     for i, (qid, _) in enumerate(eval_qs):
         q_lats = []
@@ -388,7 +376,7 @@ def run_filtered_benchmark(env):
         pf_recs.append(recall_at_k(filt, qrels[qid], 10))
         pf_mrrs.append(mrr_at_k(filt, qrels[qid], 10))
 
-    print("  PLAID+TMS filtered...", flush=True)
+    print("  Benchmarking PLAID+TMS...", flush=True)
     ptf_lats, ptf_recs, ptf_mrrs = [], [], []
     for i, (qid, _) in enumerate(eval_qs):
         q_lats = []
@@ -408,7 +396,7 @@ def run_filtered_benchmark(env):
         ptf_recs.append(recall_at_k(ranked, qrels[qid], 10))
         ptf_mrrs.append(mrr_at_k(ranked, qrels[qid], 10))
 
-    print(f"  RAGRT in-engine predicate filtering (Champion Config: nc={N_COARSE}, tau={PRUNE_TAU})...", flush=True)
+    print(f"  Benchmarking RAGRT (ndocs={K_CANDIDATES})...", flush=True)
     rf_lats, rf_recs, rf_mrrs = [], [], []
     for i, (qid, _) in enumerate(eval_qs):
         q_lats = []
@@ -417,7 +405,7 @@ def run_filtered_benchmark(env):
             t0 = time.perf_counter()
             ranked_tensor = unified_idx.search_single_query_native(
                 Q_full_128_list[i], Q_full_fp16_list[i], Q_sub3d_list[i], topc_list[i], scores_list[i],
-                N_COARSE, K_CANDIDATES, TOP_K, 0, SCIENCE_MASK, K_EIDS, 0, PRUNE_TAU)
+                N_COARSE, K_CANDIDATES, TOP_K, 0, SCIENCE_MASK, K_EIDS)
             torch.cuda.synchronize()
             q_lats.append((time.perf_counter() - t0) * 1000)
         rf_lats.append(float(np.median(q_lats)))
@@ -437,15 +425,14 @@ def run_filtered_benchmark(env):
     print("\n" + "=" * 80)
     print("FIGURE 2: FILTERED BENCHMARK RESULTS")
     print("=" * 80)
-    print(f"{'Engine':<20} | {'Latency':<10} | {'Speedup':<8} | {'Recall@10':<9} | {'MRR@10':<8}")
+    print(f"{'Engine':<16} | {'Latency':<10} | {'Speedup':<8} | {'Recall@10':<9} | {'MRR@10':<8}")
     print("-" * 80)
-    print(f"{'Stock PLAID (post)':<20} | {results['plaid_f'][0]:6.2f} ms | {'1.0x':<8} | {results['plaid_f'][1]:.4f}    | {results['plaid_f'][2]:.4f}")
-    print(f"{'PLAID+TMS (post)':<20} | {results['ptms_f'][0]:6.2f} ms | {sp_ptms:5.2f}x  | {results['ptms_f'][1]:.4f}    | {results['ptms_f'][2]:.4f}")
-    print(f"{'RAGRT (in-engine)':<20} | {results['ragrt_f'][0]:6.2f} ms | {sp_ragrt:5.2f}x  | {results['ragrt_f'][1]:.4f}    | {results['ragrt_f'][2]:.4f}")
+    print(f"{'Stock PLAID':<16} | {results['plaid_f'][0]:6.2f} ms | {'1.0x':<8} | {results['plaid_f'][1]:.4f}    | {results['plaid_f'][2]:.4f}")
+    print(f"{'PLAID+TMS':<16} | {results['ptms_f'][0]:6.2f} ms | {sp_ptms:5.2f}x  | {results['ptms_f'][1]:.4f}    | {results['ptms_f'][2]:.4f}")
+    print(f"{'RAGRT':<16} | {results['ragrt_f'][0]:6.2f} ms | {sp_ragrt:5.2f}x  | {results['ragrt_f'][1]:.4f}    | {results['ragrt_f'][2]:.4f}")
     print("=" * 80 + "\n")
 
-    # Clean 2-Panel Plot (No unmeasured DRAM guesses)
-    engines = ['Stock PLAID\n(post-filter)', 'PLAID+TMS\n(post-filter)', 'RAGRT\n(in-engine)']
+    engines = ['Stock PLAID', 'PLAID+TMS', 'RAGRT']
     colors = ['#c0392b', '#e67e22', '#2980b9']
     latencies = [results['plaid_f'][0], results['ptms_f'][0], results['ragrt_f'][0]]
     speedups  = [1.0, sp_ptms, sp_ragrt]
@@ -455,11 +442,11 @@ def run_filtered_benchmark(env):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.5))
     bars1 = ax1.bar(engines, latencies, color=colors, edgecolor='black', width=0.55)
     ax1.set_ylabel('Latency (ms)')
-    ax1.set_title('Filtered Latency (14% Selectivity, Median)', pad=15)
+    ax1.set_title('Filtered Latency (14% Selectivity)', pad=15)
     ax1.set_ylim(0, max(latencies) * 1.35)
     for b, l, s in zip(bars1, latencies, speedups):
         ax1.text(b.get_x() + b.get_width()/2, b.get_height() + max(latencies)*0.02,
-                 f'{l:.2f} ms\n({s:.1f}x)', ha='center', va='bottom', fontsize=10, fontweight='bold')
+                 f'{l:.2f} ms ({s:.1f}x)', ha='center', va='bottom', fontsize=9.5, fontweight='bold')
 
     x = np.arange(len(engines)); w = 0.35
     b_r = ax2.bar(x - w/2, recalls, w, label='Recall@10', color='#27ae60', edgecolor='black')
@@ -481,12 +468,8 @@ def run_filtered_benchmark(env):
 
 
 def run_latency_breakdown(env, std_results):
-    """
-    Figure 3: Measured Stage Breakdown with Live CUDA Event Timers.
-    Guarantees components sum mathematically to exactly 100.0%.
-    """
     print("=" * 80)
-    print("RUNNING FIGURE 3: LATENCY BREAKDOWN (LIVE MEASURED)")
+    print("FIGURE 3: LATENCY BREAKDOWN")
     print("=" * 80)
     searcher = env['searcher']; scorer = env['scorer']
     unified_idx = env['unified_idx']; eval_qs = env['eval_qs']
@@ -494,7 +477,9 @@ def run_latency_breakdown(env, std_results):
     Q_full_fp16_list = env['Q_full_fp16_list']; Q_sub3d_list = env['Q_sub3d_list']
     topc_list = env['topc_list']; scores_list = env['scores_list']
 
-    # Measure Stock PLAID per-run components together
+    plaid_tot = std_results['plaid'][0]
+    ptms_tot  = std_results['ptms'][0]
+
     plaid_s13_runs, plaid_s4_runs = [], []
     for i in range(min(20, len(eval_qs))):
         torch.cuda.synchronize()
@@ -516,7 +501,6 @@ def run_latency_breakdown(env, std_results):
     plaid_s4  = float(np.median(plaid_s4_runs))
     plaid_tot = plaid_s13 + plaid_s4
 
-    # Measure PLAID+TMS per-run components together
     ptms_s13_runs, ptms_s4_runs = [], []
     for i in range(min(20, len(eval_qs))):
         torch.cuda.synchronize()
@@ -538,7 +522,6 @@ def run_latency_breakdown(env, std_results):
     ptms_s4  = float(np.median(ptms_s4_runs))
     ptms_tot = ptms_s13 + ptms_s4
 
-    # Measure RAGRT stage breakdown using live CUDA event timers
     assert hasattr(unified_idx, "search_single_query_profiled"), \
         "FATAL: search_single_query_profiled missing from C++ extension. Rebuild first!"
 
@@ -547,11 +530,11 @@ def run_latency_breakdown(env, std_results):
         for _ in range(NUM_WARMUP):
             _ = unified_idx.search_single_query_profiled(
                 Q_full_128_list[i], Q_full_fp16_list[i], Q_sub3d_list[i], topc_list[i], scores_list[i],
-                N_COARSE, K_CANDIDATES, TOP_K, 0, 0, K_EIDS, 0, PRUNE_TAU)
+                N_COARSE, K_CANDIDATES, TOP_K, 0, 0, K_EIDS)
         for _ in range(5):
             _, stages = unified_idx.search_single_query_profiled(
                 Q_full_128_list[i], Q_full_fp16_list[i], Q_sub3d_list[i], topc_list[i], scores_list[i],
-                N_COARSE, K_CANDIDATES, TOP_K, 0, 0, K_EIDS, 0, PRUNE_TAU)
+                N_COARSE, K_CANDIDATES, TOP_K, 0, 0, K_EIDS)
             s1_l.append(stages[0]); s2_l.append(stages[1]); s3_l.append(stages[2]); s4_l.append(stages[3])
 
     r_s1 = float(np.median(s1_l))
@@ -561,17 +544,17 @@ def run_latency_breakdown(env, std_results):
     r_gpu_tot = r_s1 + r_s2 + r_s3 + r_s4
     r_wall_tot = std_results['ragrt'][0]
 
-    print("\n" + "=" * 94)
-    print("FIGURE 3: LATENCY BREAKDOWN (MEASURED LIVE)")
-    print("=" * 94)
+    print("\n" + "=" * 90)
+    print("FIGURE 3: LATENCY BREAKDOWN")
+    print("=" * 90)
     print(f"{'Engine':<16} | {'Stage 1-3 (Candidate Gen)':<28} | {'Stage 4 (MaxSim / TMS)':<24} | {'Total Latency':<12}")
-    print("-" * 94)
+    print("-" * 90)
     print(f"{'Stock PLAID':<16} | {plaid_s13:5.2f} ms ({plaid_s13/plaid_tot*100:4.1f}%)             | {plaid_s4:5.2f} ms ({plaid_s4/plaid_tot*100:4.1f}%)        | {plaid_tot:5.2f} ms")
     print(f"{'PLAID+TMS':<16} | {ptms_s13:5.2f} ms ({ptms_s13/ptms_tot*100:4.1f}%)             | {ptms_s4:5.2f} ms ({ptms_s4/ptms_tot*100:4.1f}%)         | {ptms_tot:5.2f} ms")
-    print(f"{'RAGRT (Ours)':<16} | S1:{r_s1:.2f}ms S2:{r_s2:.2f}ms S3:{r_s3:.2f}ms  | S4(TMS):{r_s4:.2f}ms ({r_s4/r_gpu_tot*100:4.1f}%)    | {r_wall_tot:5.2f} ms*")
-    print("-" * 94)
-    print(f"*Note: RAGRT GPU active kernel time is {r_gpu_tot:.2f} ms + {r_wall_tot - r_gpu_tot:.2f} ms Python/C++ dispatch overhead.")
-    print("=" * 94 + "\n")
+    print(f"{'RAGRT':<16} | S1:{r_s1:.2f}ms S2:{r_s2:.2f}ms S3:{r_s3:.2f}ms  | S4(TMS):{r_s4:.2f}ms ({r_s4/r_gpu_tot*100:4.1f}%)    | {r_wall_tot:5.2f} ms*")
+    print("-" * 90)
+    print(f"*Note: RAGRT active GPU time is {r_gpu_tot:.2f} ms ({r_wall_tot - r_gpu_tot:.2f} ms dispatch overhead).")
+    print("=" * 90 + "\n")
 
     fig, ax = plt.subplots(figsize=(13, 7))
     x_pos = [0, 1, 2]
@@ -597,15 +580,15 @@ def run_latency_breakdown(env, std_results):
     bot = 0
     for val, col, name in [(r_s1, c_r_s1, 'S1 RT'), (r_s2, c_r_s2, 'S2 Gather'), (r_s3, c_r_s3, 'S3 Score'), (r_s4, c_r_s4, 'S4 TMS')]:
         ax.bar(x_pos[2], val, bottom=bot, color=col, edgecolor='black', width=width)
-        if val >= 0.18:
+        if val >= 0.08:
             ax.text(x_pos[2], bot + val/2, f'{name}: {val:.2f} ms ({val/r_gpu_tot*100:.0f}%)',
                     ha='center', va='center', color='white', fontsize=9, fontweight='bold')
         bot += val
 
     ax.set_xticks(x_pos)
-    ax.set_xticklabels([f'Stock PLAID\n({plaid_tot:.2f} ms)', f'PLAID+TMS\n({ptms_tot:.2f} ms)', f'RAGRT (Ours)\n({r_wall_tot:.2f} ms)'])
+    ax.set_xticklabels([f'Stock PLAID\n({plaid_tot:.2f} ms)', f'PLAID+TMS\n({ptms_tot:.2f} ms)', f'RAGRT\n({r_wall_tot:.2f} ms)'])
     ax.set_ylabel('Latency (ms)')
-    ax.set_title('Per-Stage Latency Breakdown (Live Measured)', pad=20)
+    ax.set_title('Per-Stage Latency Breakdown', pad=20)
     ax.set_ylim(0, max(plaid_tot, ptms_tot) * 1.25)
 
     legend_elements = [
@@ -625,109 +608,66 @@ def run_latency_breakdown(env, std_results):
     print("  Saved fig3_latency_breakdown.png")
 
 
-def run_vram_benchmark(env):
-    print("=" * 80)
-    print("RUNNING PEAK RESIDENT VRAM BENCHMARK (LIVE)")
-    print("=" * 80)
-    searcher = env['searcher']; scorer = env['scorer']; unified_idx = env['unified_idx']
-    Q_batches = env['Q_batches']; Q_full_128_list = env['Q_full_128_list']
-    Q_full_fp16_list = env['Q_full_fp16_list']; Q_sub3d_list = env['Q_sub3d_list']
-    topc_list = env['topc_list']; scores_list = env['scores_list']
-
-    results = {}
-    for engine in ['Stock PLAID', 'PLAID+TMS', 'RAGRT']:
-        vram_peaks = []
-        for i in range(20):
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
-            torch.cuda.synchronize()
-
-            if engine == 'Stock PLAID':
-                _ = searcher.ranker.rank(searcher.config, Q_batches[i])
-            elif engine == 'PLAID+TMS':
-                pids_s3 = get_stage3_pids(searcher.ranker, searcher.config, Q_batches[i])
-                _ = scorer.score(Q_full_128_list[i], pids_s3)
-            else:
-                _ = unified_idx.search_single_query_native(
-                    Q_full_128_list[i], Q_full_fp16_list[i], Q_sub3d_list[i], topc_list[i], scores_list[i],
-                    N_COARSE, K_CANDIDATES, TOP_K, 0, 0, K_EIDS, 0, PRUNE_TAU)
-
-            torch.cuda.synchronize()
-            peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
-            vram_peaks.append(peak_mb)
-        results[engine] = float(np.median(vram_peaks))
-
-    print(f"{'Engine':<16} | {'Peak Resident VRAM':<25} | {'Memory Envelope'}")
-    print("-" * 55)
-    for k, v in results.items():
-        print(f"{k:<16} | {v:8.2f} MB              | Fits in 24 GB commodity GPU")
-    print("=" * 80 + "\n")
-    return results
-
-
 def run_pareto_sweep(env, plaid_baseline_lat):
-    """Figure 4: Pareto Sweep & Frontier Extraction - 100% LIVE, NEVER RESUMED."""
     print("=" * 80)
-    print("RUNNING FIGURE 4: PARETO SWEEP & FRONTIER (100% LIVE, 504 CONFIGS)")
+    print("FIGURE 4: PARETO SWEEP (ndocs x eids x n_coarse)")
     print("=" * 80)
     unified_idx = env['unified_idx']; eval_qs = env['eval_qs']; qrels = env['qrels']
     Q_full_128_list = env['Q_full_128_list']; Q_full_fp16_list = env['Q_full_fp16_list']
     Q_sub3d_list = env['Q_sub3d_list']; topc_list = env['topc_list']; scores_list = env['scores_list']
 
     all_results = []
-    NDOCS_LIST_LOCAL = [512, 1024, 2048, 4096, 16384, 32768, 65536]
-    EIDS_LIST_LOCAL = [1, 2, 4, 8, 16, 32]
-    TAU_LIST = [0.05, 0.10, 0.15, 0.20]
-    NCOARSE_LIST = [16, 32, 64]
-    total = len(NDOCS_LIST_LOCAL) * len(EIDS_LIST_LOCAL) * len(TAU_LIST) * len(NCOARSE_LIST)
+    # Clean ndocs list: 512, 1024, 2048, 4096, 8192, 16384, 32768
+    NDOCS_LIST_LOCAL  = [512, 1024, 2048, 4096, 8192, 16384, 32768]
+    EIDS_LIST_LOCAL   = [1, 2, 4, 8, 16, 32]
+    NCOARSE_LIST      = [16, 32, 64]
+    total = len(NDOCS_LIST_LOCAL) * len(EIDS_LIST_LOCAL) * len(NCOARSE_LIST)
 
-    print(f"  Benchmarking all {total} configs live through CorrIndex3D (no cache resume)...")
+    print(f"  Benchmarking all {total} configs live through CorrIndex3D...")
 
-    # Overwrite CSV every time to guarantee fresh provenance
     with open(PARETO_CSV_PATH, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['ndocs', 'eids', 'tau', 'n_coarse', 'lat_seq_ms', 'lat_pipe_ms', 'recall10', 'mrr10'])
+        writer.writerow(['ndocs', 'eids', 'n_coarse', 'lat_seq_ms', 'lat_pipe_ms', 'recall10', 'mrr10'])
         count = 0
         for ndocs in NDOCS_LIST_LOCAL:
             for eids in EIDS_LIST_LOCAL:
-                for tau in TAU_LIST:
-                    for n_coarse in NCOARSE_LIST:
-                        count += 1
-                        topc_0 = topc_list[0][:, :n_coarse].contiguous()
-                        lat_seq = median_lat_seq(lambda: unified_idx.search_single_query_native(
-                            Q_full_128_list[0], Q_full_fp16_list[0], Q_sub3d_list[0], topc_0, scores_list[0],
-                            n_coarse, ndocs, TOP_K, 0, 0, eids, 0, tau))
+                for n_coarse in NCOARSE_LIST:
+                    count += 1
+                    topc_0 = topc_list[0][:, :n_coarse].contiguous()
+                    lat_seq = median_lat_seq(lambda: unified_idx.search_single_query_native(
+                        Q_full_128_list[0], Q_full_fp16_list[0], Q_sub3d_list[0], topc_0, scores_list[0],
+                        n_coarse, ndocs, TOP_K, 0, 0, eids))
 
-                        bs = min(20, len(eval_qs))
-                        topc_bs = [t[:, :n_coarse].contiguous() for t in topc_list[:bs]]
-                        def run_pipe():
-                            return unified_idx.search_batch_pipelined(
-                                Q_full_128_list[:bs], Q_full_fp16_list[:bs], Q_sub3d_list[:bs],
-                                topc_bs, scores_list[:bs], n_coarse, ndocs, TOP_K, 0, 0, eids, 0, tau)
-                        for _ in range(3): run_pipe()
-                        torch.cuda.synchronize()
-                        t0 = time.perf_counter(); run_pipe(); torch.cuda.synchronize()
-                        lat_pipe = (time.perf_counter() - t0) * 1000 / bs
+                    bs = min(20, len(eval_qs))
+                    topc_bs = [t[:, :n_coarse].contiguous() for t in topc_list[:bs]]
+                    def run_pipe():
+                        return unified_idx.search_batch_pipelined(
+                            Q_full_128_list[:bs], Q_full_fp16_list[:bs], Q_sub3d_list[:bs],
+                            topc_bs, scores_list[:bs], n_coarse, ndocs, TOP_K, 0, 0, eids)
+                    for _ in range(3): run_pipe()
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter(); run_pipe(); torch.cuda.synchronize()
+                    lat_pipe = (time.perf_counter() - t0) * 1000 / bs
 
-                        topc_full = [t[:, :n_coarse].contiguous() for t in topc_list]
-                        ranked_all = unified_idx.search_batch_pipelined(
-                            Q_full_128_list, Q_full_fp16_list, Q_sub3d_list,
-                            topc_full, scores_list, n_coarse, ndocs, TOP_K, 0, 0, eids, 0, tau)
-                        recs, mrrs = [], []
-                        for i, (qid, _) in enumerate(eval_qs):
-                            ranked = ranked_all[i].cpu().tolist()
-                            recs.append(recall_at_k(ranked, qrels[qid], 10))
-                            mrrs.append(mrr_at_k(ranked, qrels[qid], 10))
-                        r10 = float(np.mean(recs)); m10 = float(np.mean(mrrs))
-                        writer.writerow([ndocs, eids, tau, n_coarse, f"{lat_seq:.3f}", f"{lat_pipe:.3f}", f"{r10:.4f}", f"{m10:.4f}"])
-                        f.flush()
-                        all_results.append({
-                            'ndocs': ndocs, 'eids': eids, 'tau': tau, 'n_coarse': n_coarse,
-                            'lat_seq': lat_seq, 'lat_pipe': lat_pipe, 'recall10': r10, 'mrr10': m10
-                        })
+                    topc_full = [t[:, :n_coarse].contiguous() for t in topc_list]
+                    ranked_all = unified_idx.search_batch_pipelined(
+                        Q_full_128_list, Q_full_fp16_list, Q_sub3d_list,
+                        topc_full, scores_list, n_coarse, ndocs, TOP_K, 0, 0, eids)
+                    recs, mrrs = [], []
+                    for i, (qid, _) in enumerate(eval_qs):
+                        ranked = ranked_all[i].cpu().tolist()
+                        recs.append(recall_at_k(ranked, qrels[qid], 10))
+                        mrrs.append(mrr_at_k(ranked, qrels[qid], 10))
+                    r10 = float(np.mean(recs)); m10 = float(np.mean(mrrs))
+                    writer.writerow([ndocs, eids, n_coarse, f"{lat_seq:.3f}", f"{lat_pipe:.3f}", f"{r10:.4f}", f"{m10:.4f}"])
+                    f.flush()
+                    all_results.append({
+                        'ndocs': ndocs, 'eids': eids, 'n_coarse': n_coarse,
+                        'lat_seq': lat_seq, 'lat_pipe': lat_pipe, 'recall10': r10, 'mrr10': m10
+                    })
 
     # Print Pareto Frontier Tables
-    for mode, lat_key in [('Sequential', 'lat_seq'), ('Pipelined', 'lat_pipe')]:
+    for mode, lat_key in [('Sequential', 'lat_seq', 'seq'), ('Pipelined', 'lat_pipe', 'pipe')]:
         sorted_r = sorted(all_results, key=lambda x: x[lat_key])
         pareto = []
         max_mrr = -1
@@ -736,18 +676,18 @@ def run_pareto_sweep(env, plaid_baseline_lat):
                 max_mrr = r['mrr10']
                 pareto.append(r)
 
-        print("\n" + "=" * 96)
-        print(f"RAGRT PARETO FRONTIER ({mode.upper()}) - LIVE MEASURED")
-        print("=" * 96)
-        print(f"{'Config':<34} | {'Latency':<10} | {'Speedup':<9} | {'MRR@10':<8} | {'Recall@10':<9}")
-        print("-" * 96)
+        print("\n" + "=" * 90)
+        print(f"RAGRT PARETO FRONTIER ({mode.upper()})")
+        print("=" * 90)
+        print(f"{'Config':<30} | {'Latency':<10} | {'Speedup':<9} | {'MRR@10':<8} | {'Recall@10':<9}")
+        print("-" * 90)
         for p in pareto:
-            cfg = f"ndocs={p['ndocs']} eids={p['eids']} tau={p['tau']} nc={p['n_coarse']}"
+            cfg = f"ndocs={p['ndocs']} eids={p['eids']} nc={p['n_coarse']}"
             sp = plaid_baseline_lat / p[lat_key]
-            print(f"{cfg:<34} | {p[lat_key]:6.2f} ms | {sp:5.2f}x    | {p['mrr10']:.4f}   | {p['recall10']:.4f}")
-        print("=" * 96 + "\n")
+            print(f"{cfg:<30} | {p[lat_key]:6.2f} ms | {sp:5.2f}x    | {p['mrr10']:.4f}   | {p['recall10']:.4f}")
+        print("=" * 90 + "\n")
 
-    # Plot Figures 4 (Sequential & Pipelined)
+    # Plot Figures 4
     for mode, lat_key, suffix in [('Sequential', 'lat_seq', 'seq'), ('Pipelined', 'lat_pipe', 'pipe')]:
         ndocs_vals = sorted(set(r['ndocs'] for r in all_results))
         colors = ['#4a148c', '#6a1b9a', '#5c6bc0', '#00897b', '#f9a825', '#ef6c00', '#c62828']
@@ -756,15 +696,13 @@ def run_pareto_sweep(env, plaid_baseline_lat):
         markers = ['^', 'v', 'o', 'D', 's', 'P']
         marker_map = {v: markers[i % len(markers)] for i, v in enumerate(eids_vals)}
         ncoarse_vals = sorted(set(r['n_coarse'] for r in all_results))
-        size_map = {16: 30, 32: 70, 64: 125}
-        tau_vals = sorted(set(r['tau'] for r in all_results))
-        alpha_map = {0.05: 1.0, 0.10: 0.7, 0.15: 0.45, 0.20: 0.25}
+        size_map = {16: 35, 32: 75, 64: 130}
 
         fig, ax = plt.subplots(figsize=(14, 8))
         for r in all_results:
             ax.scatter(r[lat_key], r['mrr10'],
                        c=[color_map[r['ndocs']]], marker=marker_map[r['eids']],
-                       s=size_map.get(r['n_coarse'], 60), alpha=alpha_map.get(round(r['tau'], 2), 0.5),
+                       s=size_map.get(r['n_coarse'], 60),
                        edgecolors='black', linewidth=0.5, zorder=3)
 
         sorted_r = sorted(all_results, key=lambda x: x[lat_key])
@@ -779,12 +717,12 @@ def run_pareto_sweep(env, plaid_baseline_lat):
             ax.plot(px, py, 'r--', linewidth=2, label='Pareto frontier', zorder=5)
             for p in pareto:
                 ax.scatter(p[lat_key], p['mrr10'], c=[color_map[p['ndocs']]], marker=marker_map[p['eids']],
-                           s=size_map.get(p['n_coarse'], 60), alpha=alpha_map.get(round(p['tau'], 2), 0.5),
+                           s=size_map.get(p['n_coarse'], 60),
                            edgecolors='black', linewidths=2.0, zorder=6)
 
         ax.set_xlabel(f'Latency (ms, {mode.lower()} median)')
         ax.set_ylabel('MRR@10')
-        ax.set_title(f'RAGRT Pareto Frontier ({mode}, 504 configs): ndocs x eids x n_coarse x tau')
+        ax.set_title(f'RAGRT Pareto Frontier ({mode}): ndocs x eids x n_coarse')
         ax.set_xscale('log')
         ax.grid(True, alpha=0.3)
 
@@ -797,11 +735,9 @@ def run_pareto_sweep(env, plaid_baseline_lat):
         h1 = [mpatches.Patch(color=color_map[v], ec='black') for v in ndocs_vals]
         leg1 = ax.legend(h1, [f'ndocs={v}' for v in ndocs_vals], title='ndocs (color)', loc='lower right', fontsize=7, title_fontsize=8, bbox_to_anchor=(1.0, 0.0))
         h2 = [plt.Line2D([0], [0], marker=marker_map[v], color='w', markerfacecolor='gray', markeredgecolor='black', markersize=7, label=f'eids={v}') for v in eids_vals]
-        leg2 = ax.legend(handles=h2, title='eids (shape)', loc='lower right', fontsize=7, title_fontsize=8, bbox_to_anchor=(1.0, 0.28))
+        leg2 = ax.legend(handles=h2, title='eids (shape)', loc='lower right', fontsize=7, title_fontsize=8, bbox_to_anchor=(1.0, 0.32))
         h3 = [plt.scatter([], [], s=size_map.get(c, 60), c='gray', edgecolors='black') for c in ncoarse_vals]
-        leg3 = ax.legend(h3, [f'n_coarse={c}' for c in ncoarse_vals], title='n_coarse (size)', loc='lower right', fontsize=7, title_fontsize=8, bbox_to_anchor=(1.0, 0.52))
-        h4 = [plt.scatter([], [], s=80, c='gray', alpha=alpha_map.get(round(t, 2), 0.5), edgecolors='black') for t in tau_vals]
-        ax.legend(h4, [f'tau={t:.2f}' for t in tau_vals], title='tau (opacity)', loc='lower right', fontsize=7, title_fontsize=8, bbox_to_anchor=(1.0, 0.72))
+        leg3 = ax.legend(h3, [f'n_coarse={c}' for c in ncoarse_vals], title='n_coarse (size)', loc='lower right', fontsize=7, title_fontsize=8, bbox_to_anchor=(1.0, 0.60))
         ax.add_artist(leg1); ax.add_artist(leg2); ax.add_artist(leg3)
 
         plt.tight_layout()
@@ -812,17 +748,16 @@ def run_pareto_sweep(env, plaid_baseline_lat):
 
 def main():
     print("\n" + "=" * 80)
-    print("STARTING FULL RAGRT BENCHMARK SUITE (100% VERIFIED LIVE)")
+    print("STARTING RAGRT BENCHMARK SUITE")
     print("=" * 80 + "\n")
     env = setup_engines()
     std_results = run_standard_benchmark(env)
     filt_results = run_filtered_benchmark(env)
     run_latency_breakdown(env, std_results)
-    run_vram_benchmark(env)
     run_pareto_sweep(env, std_results['plaid'][0])
 
     print("\n" + "=" * 80)
-    print("ALL TESTS & FIGURES COMPLETED (ZERO FALLBACKS, FULL PROVENANCE)")
+    print("ALL TESTS & FIGURES COMPLETED")
     print("=" * 80)
 
 

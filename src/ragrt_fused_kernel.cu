@@ -6,6 +6,7 @@
 #define MAX_TASKS 1048576
 #define NUM_3D_SUBSPACES 32
 #define MIN_BASE_SCORE 0.0f
+#define WARPS_PER_BLOCK 8
 
 __device__ __forceinline__ void atomicMaxHalf(half* addr, half val) {
 #if __CUDA_ARCH__ >= 700
@@ -29,49 +30,91 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
     int* __restrict__ d_task_qt, int64_t* __restrict__ d_task_offset,
     int* __restrict__ d_task_length, float* __restrict__ d_task_base_score
 ) {
-    __shared__ int   s_top_eid[8][64];
-    __shared__ float s_top_val[8][64];
+    __shared__ int   s_top_eid[WARPS_PER_BLOCK][64];
+    __shared__ float s_top_val[WARPS_PER_BLOCK][64];
+    __shared__ int   s_hits_eid[WARPS_PER_BLOCK][128];
+    __shared__ float s_hits_val[WARPS_PER_BLOCK][128];
 
-    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    int lane_id = threadIdx.x % 32;
+    int warp_id       = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane_id       = threadIdx.x % 32;
     int warp_in_block = threadIdx.x / 32;
     if (warp_id >= total_rays) return;
 
     int qt = warp_id / NUM_3D_SUBSPACES;
     int s  = warp_id % NUM_3D_SUBSPACES;
-
-    if (qt >= ntok || s >= NUM_3D_SUBSPACES) return;
+    if (qt >= ntok) return;
 
     int n_hits = out_hit_count[warp_id];
     if (n_hits > max_hits) n_hits = max_hits;
     int want = (k_eids < n_hits) ? k_eids : n_hits;
-    int nsel = 0;
+    int base_hit = warp_id * max_hits;
 
-    if (lane_id == 0 && want > 0) {
-        int base_hit = warp_id * max_hits;
-        for (int r = 0; r < want; ++r) {
-            float best_v = -1e30f;
-            int   best_i = -1;
-            for (int i = 0; i < n_hits; ++i) {
-                int eid = out_c[base_hit + i];
-                if (eid < 0 || eid >= 256) continue;
-                bool dup = false;
-                for (int k = 0; k < nsel; ++k) {
-                    if (s_top_eid[warp_in_block][k] == eid) { dup = true; break; }
-                }
-                if (dup) continue;
-                float v = out_v[base_hit + i];
-                if (v > best_v) { best_v = v; best_i = i; }
-            }
-            if (best_i < 0) break;
-            s_top_eid[warp_in_block][nsel] = out_c[base_hit + best_i];
-            s_top_val[warp_in_block][nsel] = best_v;
-            ++nsel;
-        }
+    // 1. Cooperative Parallel Loading of hits across all 32 lanes
+    for (int i = lane_id; i < n_hits; i += 32) {
+        s_hits_eid[warp_in_block][i] = out_c[base_hit + i];
+        s_hits_val[warp_in_block][i] = out_v[base_hit + i];
+    }
+    // Pad remaining slots
+    for (int i = n_hits + lane_id; i < 128; i += 32) {
+        s_hits_eid[warp_in_block][i] = -1;
+        s_hits_val[warp_in_block][i] = -1e30f;
     }
     __syncwarp();
-    nsel = __shfl_sync(0xFFFFFFFF, nsel, 0);
 
+    // 2. 32-Lane Parallel Top-K Selection Sort via Warp Shuffles (Zero idle threads!)
+    int nsel = 0;
+    for (int r = 0; r < want; ++r) {
+        float my_best_v = -1e30f;
+        int   my_best_i = -1;
+
+        // Each lane checks its 4 strided elements
+        #pragma unroll
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int i = lane_id + chunk * 32;
+            if (i < n_hits) {
+                int eid = s_hits_eid[warp_in_block][i];
+                float v = s_hits_val[warp_in_block][i];
+                if (eid >= 0 && v > my_best_v) {
+                    my_best_v = v;
+                    my_best_i = i;
+                }
+            }
+        }
+
+        // 5-Cycle Unrolled Warp Reduction to find winner
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            float other_v = __shfl_down_sync(0xFFFFFFFF, my_best_v, offset);
+            int   other_i = __shfl_down_sync(0xFFFFFFFF, my_best_i, offset);
+            if (other_v > my_best_v) {
+                my_best_v = other_v;
+                my_best_i = other_i;
+            }
+        }
+
+        int winner_i = __shfl_sync(0xFFFFFFFF, my_best_i, 0);
+        if (winner_i < 0) break;
+
+        int winner_eid = s_hits_eid[warp_in_block][winner_i];
+        if (lane_id == 0) {
+            s_top_eid[warp_in_block][nsel] = winner_eid;
+            s_top_val[warp_in_block][nsel] = s_hits_val[warp_in_block][winner_i];
+            nsel++;
+        }
+        nsel = __shfl_sync(0xFFFFFFFF, nsel, 0);
+
+        // Deduplicate: Invalidate all occurrences of winner_eid in parallel across warp
+        #pragma unroll
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int i = lane_id + chunk * 32;
+            if (i < n_hits && s_hits_eid[warp_in_block][i] == winner_eid) {
+                s_hits_eid[warp_in_block][i] = -1;
+            }
+        }
+        __syncwarp();
+    }
+
+    // 3. Parallel CSR Lookups & Warp-Aggregated Atomic Task Allocation
     int total_combos = nsel * k_cent;
     int64_t s_row_base = (int64_t)s * (num_centroids + 1);
 
@@ -81,36 +124,62 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
 
         int eid = s_top_eid[warp_in_block][h];
         int cid = topc[qt * k_cent + c];
-        if (cid < 0 || cid >= num_centroids) continue;
 
-        int row_start = csr_row_ptrs[s_row_base + cid];
-        int row_end   = csr_row_ptrs[s_row_base + cid + 1];
-        if (row_end <= row_start) continue;
+        int task_found = 0;
+        int64_t task_off = 0;
+        int task_len = 0;
+        float task_base = 0.0f;
 
-        // Binary search on uint8_t EIDs (0 .. 255)
-        int found_idx = -1;
-        int lo = row_start, hi = row_end;
-        while (lo < hi) {
-            int mid = lo + ((hi - lo) >> 1);
-            int e = (int)csr_col_eids[mid];
-            if (e == eid) { found_idx = mid; break; }
-            else if (e < eid) lo = mid + 1;
-            else hi = mid;
+        if (cid >= 0 && cid < num_centroids) {
+            int row_start = csr_row_ptrs[s_row_base + cid];
+            int row_end   = csr_row_ptrs[s_row_base + cid + 1];
+
+            // Branchless binary search over uint8 EIDs
+            int lo = row_start, hi = row_end, found_idx = -1;
+            while (lo < hi) {
+                int mid = lo + ((hi - lo) >> 1);
+                int e = (int)csr_col_eids[mid];
+                if (e == eid) { found_idx = mid; break; }
+                else if (e < eid) lo = mid + 1;
+                else hi = mid;
+            }
+
+            if (found_idx >= 0) {
+                int length = (int)csr_lengths[found_idx];
+                if (length > 0) {
+                    float base_score = scores[qt * num_centroids + cid] + s_top_val[warp_in_block][h];
+                    if (base_score > MIN_BASE_SCORE) {
+                        task_found = 1;
+                        task_off = csr_offsets[found_idx];
+                        task_len = length;
+                        task_base = base_score;
+                    }
+                }
+            }
         }
 
-        if (found_idx >= 0) {
-            int length = (int)csr_lengths[found_idx];
-            if (length <= 0) continue;
+        // Warp-Aggregated AtomicAdd: 1 atomic add per warp instead of 32!
+        unsigned int active = __activemask();
+        unsigned int mask   = __ballot_sync(active, task_found);
 
-            float base_score = scores[qt * num_centroids + cid] + s_top_val[warp_in_block][h];
-            if (base_score <= MIN_BASE_SCORE) continue;
+        if (task_found) {
+            int leader = __ffs(mask) - 1;
+            int warp_total = __popc(mask);
+            int base_idx = 0;
 
-            int task_idx = atomicAdd(d_num_tasks, 1);
-            if (task_idx < MAX_TASKS) {
-                d_task_qt[task_idx]         = qt;
-                d_task_offset[task_idx]     = csr_offsets[found_idx];
-                d_task_length[task_idx]     = length;
-                d_task_base_score[task_idx] = base_score;
+            if (lane_id == leader) {
+                base_idx = atomicAdd(d_num_tasks, warp_total);
+            }
+            base_idx = __shfl_sync(active, base_idx, leader);
+
+            int rank = __popc(mask & ((1u << lane_id) - 1));
+            int my_task_idx = base_idx + rank;
+
+            if (my_task_idx < MAX_TASKS) {
+                d_task_qt[my_task_idx]         = qt;
+                d_task_offset[my_task_idx]     = task_off;
+                d_task_length[my_task_idx]     = task_len;
+                d_task_base_score[my_task_idx] = task_base;
             } else {
                 atomicAdd(d_num_dropped, 1);
             }
@@ -275,36 +344,6 @@ extern "C" void launch_ragrt_fused_stage23_csr256(
     );
 }
 
-extern "C" half* ragrt_approx_score_buffer(int buf_idx) {
-    if (!g_buffers_allocated || buf_idx < 0 || buf_idx > 1) return nullptr;
-    return g_d_qt_pid_max_fp16[buf_idx];
-}
-
-extern "C" int ragrt_dropped_task_count(int buf_idx) {
-    int h = 0;
-    if (!g_buffers_allocated || buf_idx < 0 || buf_idx > 1) return 0;
-    cudaMemcpy(&h, g_d_num_dropped_tasks[buf_idx], sizeof(int), cudaMemcpyDeviceToHost);
-    return h;
-}
-
-extern "C" void launch_rt_maxsim_rescore_from_approx(
-    const half* d_approx, const int* d_pids,
-    int num_cands, int ntok, int num_passages,
-    float* d_out_scores, cudaStream_t stream
-) {
-    if (num_cands <= 0) return;
-    int active_ntok = (ntok <= 32) ? ntok : 32;
-    int threads = 256;
-    int blocks = (num_cands + threads - 1) / threads;
-    rt_maxsim_rescore_from_approx_kernel<<<blocks, threads, 0, stream>>>(
-        d_approx, d_pids, num_cands, active_ntok, num_passages, d_out_scores
-    );
-}
-
-
-
-
-// Append to ragrt_fused_kernel.cu
 extern "C" void launch_ragrt_stage2_only(
     const int* d_out_c, const float* d_out_v, const int* d_out_hit_count,
     const int* d_topc, const float* d_scores,
@@ -350,5 +389,31 @@ extern "C" void launch_ragrt_stage3_only(
     int pass_blocks = (num_passages + threads - 1) / threads;
     sum_passages_fp16_to_fp32_kernel<<<pass_blocks, threads, 0, stream>>>(
         g_d_qt_pid_max_fp16[buf_idx], active_ntok, num_passages, d_passage_scores
+    );
+}
+
+extern "C" half* ragrt_approx_score_buffer(int buf_idx) {
+    if (!g_buffers_allocated || buf_idx < 0 || buf_idx > 1) return nullptr;
+    return g_d_qt_pid_max_fp16[buf_idx];
+}
+
+extern "C" int ragrt_dropped_task_count(int buf_idx) {
+    int h = 0;
+    if (!g_buffers_allocated || buf_idx < 0 || buf_idx > 1) return 0;
+    cudaMemcpy(&h, g_d_num_dropped_tasks[buf_idx], sizeof(int), cudaMemcpyDeviceToHost);
+    return h;
+}
+
+extern "C" void launch_rt_maxsim_rescore_from_approx(
+    const half* d_approx, const int* d_pids,
+    int num_cands, int ntok, int num_passages,
+    float* d_out_scores, cudaStream_t stream
+) {
+    if (num_cands <= 0) return;
+    int active_ntok = (ntok <= 32) ? ntok : 32;
+    int threads = 256;
+    int blocks = (num_cands + threads - 1) / threads;
+    rt_maxsim_rescore_from_approx_kernel<<<blocks, threads, 0, stream>>>(
+        d_approx, d_pids, num_cands, active_ntok, num_passages, d_out_scores
     );
 }
