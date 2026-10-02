@@ -170,7 +170,7 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
             if (lane_id == leader) {
                 base_idx = atomicAdd(d_num_tasks, warp_total);
             }
-            base_idx = __shfl_sync(active, base_idx, leader);
+            base_idx = __shfl_sync(mask, base_idx, leader);
 
             int rank = __popc(mask & ((1u << lane_id) - 1));
             int my_task_idx = base_idx + rank;
@@ -331,7 +331,7 @@ extern "C" void launch_ragrt_fused_stage23_csr256(
         g_d_task_qt[buf_idx], g_d_task_offset[buf_idx], g_d_task_length[buf_idx], g_d_task_base_score[buf_idx]
     );
 
-    int coop_blocks = 108;
+    int coop_blocks = 142;
     cooperative_score_passages_csr_fp16_filtered_kernel<<<coop_blocks, threads, 0, stream>>>(
         g_d_num_tasks[buf_idx], g_d_task_queue_counter[buf_idx], g_d_task_qt[buf_idx], g_d_task_offset[buf_idx],
         g_d_task_length[buf_idx], g_d_task_base_score[buf_idx], d_map_packed_24, num_passages, g_d_qt_pid_max_fp16[buf_idx],
