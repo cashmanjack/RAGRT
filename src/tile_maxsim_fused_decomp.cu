@@ -19,7 +19,7 @@ __global__ void tile_maxsim_fused_decomp_kernel(
     const uint8_t* __restrict__ decomp_table,               // [256, 4]
     float*         __restrict__ out_scores                  // [num_cands]
 ) {
-    __shared__ half s_doc_emb[WARPS_PER_BLOCK][2][128];
+    __shared__ half s_doc_emb[WARPS_PER_BLOCK][2][136];
 
     int warp_id  = threadIdx.x / WARP_SIZE;
     int lane_id  = threadIdx.x % WARP_SIZE;
