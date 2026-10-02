@@ -12,7 +12,6 @@ setup(
             [
                 "optix_corr_torch_3d.cpp",
                 "ragrt_fused_kernel.cu",
-                "tile_maxsim_kernel.cu",
                 "tile_maxsim_fused_decomp.cu",
             ],
             include_dirs=[
