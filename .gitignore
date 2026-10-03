@@ -1,6 +1,12 @@
-.aider*
-.env
-reference/
-__pycache__/
-*.pyc
-.DS_Store
+# generated artifacts (recreated live every run)
+**/*.npz
+**/*.png
+**/*.csv
+# large data dirs (never commit)
+src/experiments/
+src/data/
+# stale backups
+code_backup_v1/
+src_256_baseline_20260929/
+# python
+src/__pycache__/
