@@ -24,7 +24,7 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
     const int* __restrict__ out_c, const float* __restrict__ out_v, const int* __restrict__ out_hit_count,
     const int* __restrict__ topc, const float* __restrict__ scores,
     const int* __restrict__ csr_row_ptrs, const uint8_t* __restrict__ csr_col_eids,
-    const int64_t* __restrict__ csr_offsets, const uint16_t* __restrict__ csr_lengths,
+    const int64_t* __restrict__ csr_block_sums, const uint16_t* __restrict__ csr_lengths,
     int total_rays, int max_hits, int k_eids, int k_cent, int ntok, int num_centroids,
     int* __restrict__ d_num_tasks, int* __restrict__ d_num_dropped,
     int* __restrict__ d_task_qt, int64_t* __restrict__ d_task_offset,
@@ -54,20 +54,18 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
         s_hits_eid[warp_in_block][i] = out_c[base_hit + i];
         s_hits_val[warp_in_block][i] = out_v[base_hit + i];
     }
-    // Pad remaining slots
     for (int i = n_hits + lane_id; i < 128; i += 32) {
         s_hits_eid[warp_in_block][i] = -1;
         s_hits_val[warp_in_block][i] = -1e30f;
     }
     __syncwarp();
 
-    // 2. 32-Lane Parallel Top-K Selection Sort via Warp Shuffles (Zero idle threads!)
+    // 2. 32-Lane Parallel Top-K Selection Sort via Warp Shuffles
     int nsel = 0;
     for (int r = 0; r < want; ++r) {
         float my_best_v = -1e30f;
         int   my_best_i = -1;
 
-        // Each lane checks its 4 strided elements
         #pragma unroll
         for (int chunk = 0; chunk < 4; ++chunk) {
             int i = lane_id + chunk * 32;
@@ -81,7 +79,6 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
             }
         }
 
-        // 5-Cycle Unrolled Warp Reduction to find winner
         #pragma unroll
         for (int offset = 16; offset > 0; offset /= 2) {
             float other_v = __shfl_down_sync(0xFFFFFFFF, my_best_v, offset);
@@ -103,7 +100,6 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
         }
         nsel = __shfl_sync(0xFFFFFFFF, nsel, 0);
 
-        // Deduplicate: Invalidate all occurrences of winner_eid in parallel across warp
         #pragma unroll
         for (int chunk = 0; chunk < 4; ++chunk) {
             int i = lane_id + chunk * 32;
@@ -114,7 +110,7 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
         __syncwarp();
     }
 
-    // 3. Parallel CSR Lookups & Warp-Aggregated Atomic Task Allocation
+    // 3. Parallel CSR Lookups & Hierarchical Block-Offset Reconstruction
     int total_combos = nsel * k_cent;
     int64_t s_row_base = (int64_t)s * (num_centroids + 1);
 
@@ -134,7 +130,6 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
             int row_start = csr_row_ptrs[s_row_base + cid];
             int row_end   = csr_row_ptrs[s_row_base + cid + 1];
 
-            // Branchless binary search over uint8 EIDs
             int lo = row_start, hi = row_end, found_idx = -1;
             while (lo < hi) {
                 int mid = lo + ((hi - lo) >> 1);
@@ -150,15 +145,25 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
                     float base_score = scores[qt * num_centroids + cid] + s_top_val[warp_in_block][h];
                     if (base_score > MIN_BASE_SCORE) {
                         task_found = 1;
-                        task_off = csr_offsets[found_idx];
-                        task_len = length;
+
+                        // Reconstruct exact offset from 52 MB block sums + L1-resident lengths
+                        int b_idx   = found_idx >> 7; // found_idx / 128
+                        int b_start = b_idx << 7;     // b_idx * 128
+                        int64_t calculated_off = csr_block_sums[b_idx];
+                        #pragma unroll 8
+                        for (int k = b_start; k < found_idx; ++k) {
+                            calculated_off += (int64_t)csr_lengths[k];
+                        }
+
+                        task_off  = calculated_off;
+                        task_len  = length;
                         task_base = base_score;
                     }
                 }
             }
         }
 
-        // Warp-Aggregated AtomicAdd: 1 atomic add per warp instead of 32!
+        // Warp-Aggregated AtomicAdd
         unsigned int active = __activemask();
         unsigned int mask   = __ballot_sync(active, task_found);
 
@@ -308,7 +313,7 @@ extern "C" void launch_ragrt_fused_stage23_csr256(
     const int* d_topc, const float* d_scores,
     int total_rays, int max_hits, int k_eids, int k_cent, int ntok, int num_centroids,
     const int* d_csr_row_ptrs, const uint8_t* d_csr_col_eids,
-    const int64_t* d_csr_offsets, const uint16_t* d_csr_lengths, const uint8_t* d_map_packed_24,
+    const int64_t* d_csr_block_sums, const uint16_t* d_csr_lengths, const uint8_t* d_map_packed_24,
     float* d_passage_scores, int num_passages,
     const uint32_t* d_doc_predicates, uint32_t query_mask,
     int buf_idx, cudaStream_t stream
@@ -325,7 +330,7 @@ extern "C" void launch_ragrt_fused_stage23_csr256(
     int blocks_collect = (total_rays * 32 + threads - 1) / threads;
     collect_posting_tasks_csr_warp_kernel<<<blocks_collect, threads, 0, stream>>>(
         d_out_c, d_out_v, d_out_hit_count, d_topc, d_scores,
-        d_csr_row_ptrs, d_csr_col_eids, d_csr_offsets, d_csr_lengths,
+        d_csr_row_ptrs, d_csr_col_eids, d_csr_block_sums, d_csr_lengths,
         total_rays, max_hits, k_eids, k_cent, active_ntok, num_centroids,
         g_d_num_tasks[buf_idx], g_d_num_dropped_tasks[buf_idx],
         g_d_task_qt[buf_idx], g_d_task_offset[buf_idx], g_d_task_length[buf_idx], g_d_task_base_score[buf_idx]
@@ -349,7 +354,7 @@ extern "C" void launch_ragrt_stage2_only(
     const int* d_topc, const float* d_scores,
     int total_rays, int max_hits, int k_eids, int k_cent, int ntok, int num_centroids,
     const int* d_csr_row_ptrs, const uint8_t* d_csr_col_eids,
-    const int64_t* d_csr_offsets, const uint16_t* d_csr_lengths,
+    const int64_t* d_csr_block_sums, const uint16_t* d_csr_lengths,
     int buf_idx, cudaStream_t stream
 ) {
     ensure_alloc(g_allocated_passages > 0 ? g_allocated_passages : 2430000);
@@ -363,7 +368,7 @@ extern "C" void launch_ragrt_stage2_only(
     int blocks_collect = (total_rays * 32 + threads - 1) / threads;
     collect_posting_tasks_csr_warp_kernel<<<blocks_collect, threads, 0, stream>>>(
         d_out_c, d_out_v, d_out_hit_count, d_topc, d_scores,
-        d_csr_row_ptrs, d_csr_col_eids, d_csr_offsets, d_csr_lengths,
+        d_csr_row_ptrs, d_csr_col_eids, d_csr_block_sums, d_csr_lengths,
         total_rays, max_hits, k_eids, k_cent, active_ntok, num_centroids,
         g_d_num_tasks[buf_idx], g_d_num_dropped_tasks[buf_idx],
         g_d_task_qt[buf_idx], g_d_task_offset[buf_idx], g_d_task_length[buf_idx], g_d_task_base_score[buf_idx]
@@ -379,7 +384,7 @@ extern "C" void launch_ragrt_stage3_only(
     cudaMemsetAsync(g_d_qt_pid_max_fp16[buf_idx], 0, active_ntok * num_passages * sizeof(half), stream);
 
     int threads = 256;
-    int coop_blocks = 108;
+    int coop_blocks = 142;
     cooperative_score_passages_csr_fp16_filtered_kernel<<<coop_blocks, threads, 0, stream>>>(
         g_d_num_tasks[buf_idx], g_d_task_queue_counter[buf_idx], g_d_task_qt[buf_idx], g_d_task_offset[buf_idx],
         g_d_task_length[buf_idx], g_d_task_base_score[buf_idx], d_map_packed_24, num_passages, g_d_qt_pid_max_fp16[buf_idx],

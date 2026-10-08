@@ -10,3 +10,7 @@ code_backup_v1/
 src_256_baseline_20260929/
 # python
 src/__pycache__/
+reference/
+src/lotte/
+src/msmarco/
+*.DS_Store

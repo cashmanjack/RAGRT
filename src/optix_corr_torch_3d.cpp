@@ -39,7 +39,7 @@ extern "C" void launch_ragrt_fused_stage23_csr256(
     const int* d_topc, const float* d_scores,
     int total_rays, int max_hits, int k_eids, int k_cent, int ntok, int num_centroids,
     const int* d_csr_row_ptrs, const uint8_t* d_csr_col_eids,
-    const int64_t* d_csr_offsets, const uint16_t* d_csr_lengths, const uint8_t* d_map_packed_24,
+    const int64_t* d_csr_block_sums, const uint16_t* d_csr_lengths, const uint8_t* d_map_packed_24,
     float* d_passage_scores, int num_passages,
     const uint32_t* d_doc_predicates, uint32_t query_mask,
     int buf_idx, cudaStream_t stream
@@ -66,7 +66,7 @@ extern "C" void launch_ragrt_stage2_only(
     const int* d_topc, const float* d_scores,
     int total_rays, int max_hits, int k_eids, int k_cent, int ntok, int num_centroids,
     const int* d_csr_row_ptrs, const uint8_t* d_csr_col_eids,
-    const int64_t* d_csr_offsets, const uint16_t* d_csr_lengths,
+    const int64_t* d_csr_block_sums, const uint16_t* d_csr_lengths,
     int buf_idx, cudaStream_t stream
 );
 
@@ -101,7 +101,7 @@ public:
     cudaEvent_t event_tms_done[2];
 
     bool is_bound = false;
-    torch::Tensor b_csr_row_ptrs, b_csr_col_eids, b_csr_offsets, b_csr_lengths, b_map_packed;
+    torch::Tensor b_csr_row_ptrs, b_csr_col_eids, b_csr_block_sums, b_csr_lengths, b_map_packed;
     torch::Tensor b_doc_offsets, b_doc_lens, b_codes, b_residuals;
     torch::Tensor b_centroids_128, b_bucket_weights, b_reversed_bit_map, b_decomp_table;
     torch::Tensor b_doc_predicates;
@@ -116,7 +116,7 @@ public:
         std::vector<char> ptx; TORCH_CHECK(loadPTX(ptx_path, ptx), "failed to load candidate PTX");
         OptixModuleCompileOptions mco={}; mco.optLevel=OPTIX_COMPILE_OPTIMIZATION_LEVEL_3;
         OptixPipelineCompileOptions pco={}; pco.traversableGraphFlags=OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_ANY;
-        pco.numPayloadValues=2; // Payload 0: ray_id, Payload 1: private hit counter (zero atomics!)
+        pco.numPayloadValues=2;
         pco.numAttributeValues=2;
         pco.pipelineLaunchParamsVariableName="params";
         OPTIX_CHECK(optixModuleCreate(ctx,&mco,&pco,ptx.data(),ptx.size(),nullptr,nullptr,&mod));
@@ -255,7 +255,7 @@ public:
 
     void bind_index(
         torch::Tensor csr_row_ptrs, torch::Tensor csr_col_eids,
-        torch::Tensor csr_offsets, torch::Tensor csr_lengths, torch::Tensor map_packed,
+        torch::Tensor csr_block_sums, torch::Tensor csr_lengths, torch::Tensor map_packed,
         torch::Tensor doc_offsets, torch::Tensor doc_lens,
         torch::Tensor codes, torch::Tensor residuals, torch::Tensor centroids_128,
         torch::Tensor bucket_weights, torch::Tensor reversed_bit_map, torch::Tensor decomp_table,
@@ -263,7 +263,7 @@ public:
     ) {
         b_csr_row_ptrs = csr_row_ptrs.to(torch::kInt32).contiguous();
         b_csr_col_eids = csr_col_eids.contiguous();
-        b_csr_offsets = csr_offsets.contiguous();
+        b_csr_block_sums = csr_block_sums.contiguous(); // 52 MB block sums instead of 6.72 GB offsets!
         b_csr_lengths = csr_lengths.contiguous();
         b_map_packed = map_packed.contiguous();
         b_doc_offsets = doc_offsets.contiguous();
@@ -327,7 +327,7 @@ public:
             topc.data_ptr<int>(), scores.data_ptr<float>(),
             total_rays, 128, k_eids, k_cent, nq, b_num_centroids,
             b_csr_row_ptrs.data_ptr<int>(), (const uint8_t*)b_csr_col_eids.data_ptr(),
-            b_csr_offsets.data_ptr<int64_t>(), (const uint16_t*)b_csr_lengths.data_ptr(), b_map_packed.data_ptr<uint8_t>(),
+            b_csr_block_sums.data_ptr<int64_t>(), (const uint16_t*)b_csr_lengths.data_ptr(), b_map_packed.data_ptr<uint8_t>(),
             d_passage_scores[0].data_ptr<float>(), (int)b_num_passages,
             (const uint32_t*)b_doc_predicates.data_ptr(), query_mask, 0, 0
         );
@@ -390,24 +390,21 @@ public:
         cudaEventCreate(&ev0); cudaEventCreate(&ev1); cudaEventCreate(&ev2);
         cudaEventCreate(&ev3); cudaEventCreate(&ev4);
 
-        // Stage 1: OptiX Ray Tracing
         cudaEventRecord(ev0, 0);
         CUDA_CHECK(cudaMemcpy(d_p_single, &p, sizeof(CorrParams3D), cudaMemcpyHostToDevice));
         OPTIX_CHECK(optixLaunch(pipe, nullptr, (CUdeviceptr)d_p_single, sizeof(CorrParams3D), &sbt, total_rays, 1, 1));
         cudaEventRecord(ev1, 0);
 
-        // Stage 2: CSR Gather Tasks
         launch_ragrt_stage2_only(
             buf_out_c[0].data_ptr<int>(), buf_out_v[0].data_ptr<float>(), buf_out_n[0].data_ptr<int>(),
             topc.data_ptr<int>(), scores.data_ptr<float>(),
             total_rays, 128, k_eids, k_cent, nq, b_num_centroids,
             b_csr_row_ptrs.data_ptr<int>(), (const uint8_t*)b_csr_col_eids.data_ptr(),
-            b_csr_offsets.data_ptr<int64_t>(), (const uint16_t*)b_csr_lengths.data_ptr(),
+            b_csr_block_sums.data_ptr<int64_t>(), (const uint16_t*)b_csr_lengths.data_ptr(),
             0, 0
         );
         cudaEventRecord(ev2, 0);
 
-        // Stage 3: Cooperative Passage Scoring & Sum Reduction
         d_passage_scores[0].zero_();
         launch_ragrt_stage3_only(
             b_map_packed.data_ptr<uint8_t>(), d_passage_scores[0].data_ptr<float>(), (int)b_num_passages,
@@ -417,7 +414,6 @@ public:
         auto candidate_pids = std::get<1>(topk_cands).to(torch::kInt32).contiguous();
         cudaEventRecord(ev3, 0);
 
-        // Stage 4: TileMaxSim Rerank
         launch_tile_maxsim_fused_decomp(
             Q_full_fp16.data_ptr(), candidate_pids.data_ptr<int>(), b_doc_offsets.data_ptr<int64_t>(), b_doc_lens.data_ptr<int>(),
             k_candidates, b_codes.data_ptr<int>(), b_residuals.data_ptr<uint8_t>(), b_centroids_128.data_ptr(),
@@ -504,7 +500,7 @@ public:
                     topc_list[i].data_ptr<int>(), scores_list[i].data_ptr<float>(),
                     total_rays, 128, k_eids, k_cent, nq, b_num_centroids,
                     b_csr_row_ptrs.data_ptr<int>(), (const uint8_t*)b_csr_col_eids.data_ptr(),
-                    b_csr_offsets.data_ptr<int64_t>(), (const uint16_t*)b_csr_lengths.data_ptr(), b_map_packed.data_ptr<uint8_t>(),
+                    b_csr_block_sums.data_ptr<int64_t>(), (const uint16_t*)b_csr_lengths.data_ptr(), b_map_packed.data_ptr<uint8_t>(),
                     d_passage_scores[buf_idx].data_ptr<float>(), (int)b_num_passages,
                     (const uint32_t*)b_doc_predicates.data_ptr(), query_mask, buf_idx, stream_cand
                 );

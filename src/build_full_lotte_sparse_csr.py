@@ -1,4 +1,4 @@
-import os, sys, shutil, torch, numpy as np, argparse
+import os, sys, shutil, torch, numpy as np, argparse, gc
 from scipy.spatial import cKDTree
 
 BASE_DIR = "/home/min/a/cashman3/RTRAG/src"
@@ -23,7 +23,9 @@ def main():
 
     os.makedirs(args.outdir, exist_ok=True)
     print("=" * 90)
-    print(f"BUILDING FULL LOTTE 2.4M PASSAGE SPARSE CSR INDEX (Top-{args.top_m})")
+    print(f"BUILDING SPARSE CSR INDEX (Top-{args.top_m})")
+    print(f"Index : {args.index}")
+    print(f"Outdir: {args.outdir}")
     print("=" * 90)
 
     print(f"Loading searcher from {args.index}...")
@@ -49,7 +51,7 @@ def main():
     codes = searcher.ranker.embeddings.codes.numpy()
     residuals_packed = searcher.ranker.embeddings.residuals.numpy()
     total_tokens = codes.shape[0]
-    print(f"Full LoTTE Corpus: {total_tokens:,} tokens | Coarse Centroids: {MAX_CID}")
+    print(f"Corpus: {total_tokens:,} tokens | Coarse Centroids: {MAX_CID}")
 
     doclens = flatten(load_doclens(args.index, flatten=False))
     dl = torch.tensor(doclens, dtype=torch.long)
@@ -66,34 +68,32 @@ def main():
     if not os.path.exists(cb_path):
         src_cb = "/local/scratch/a/cashman3/juno_pq_science_sparse8/codebooks.npy"
         if not os.path.exists(src_cb):
-            src_cb = "/local/scratch/a/cashman3/juno_pq_science_3d/codebooks.npy"
+            src_cb = "/local/scratch/a/cashman3/juno_pq_lotte_full_sparse8/codebooks.npy"
         shutil.copyfile(src_cb, cb_path)
         print(f"Copied codebooks from {src_cb}")
 
     codebooks = np.load(cb_path)
     trees = [cKDTree(codebooks[s]) for s in range(NUM_SUBSPACES)]
 
-    print(f"Quantizing tokens with Semantic-Energy Top-{args.top_m} Subspace Allocation...")
-    all_eids = np.zeros((NUM_SUBSPACES, total_tokens), dtype=np.int16)
-    active_mask = np.zeros((NUM_SUBSPACES, total_tokens), dtype=bool)
+    # Use disk-backed memory-mapping to keep RAM usage under 15 GB!
+    mmap_eids_path = os.path.join(args.outdir, "all_eids_tmp.mmap")
+    mmap_mask_path = os.path.join(args.outdir, "active_mask_tmp.mmap")
+    all_eids = np.memmap(mmap_eids_path, dtype=np.int16, mode='w+', shape=(NUM_SUBSPACES, total_tokens))
+    active_mask = np.memmap(mmap_mask_path, dtype=bool, mode='w+', shape=(NUM_SUBSPACES, total_tokens))
 
+    print(f"Quantizing tokens with Semantic-Energy Top-{args.top_m} Subspace Allocation (Disk-backed memmap)...")
     R_cuda = R.cuda()
     for start in range(0, total_tokens, CHUNK):
         end = min(start + CHUNK, total_tokens)
         obj = ResidualEmbeddings(torch.tensor(codes[start:end]), torch.tensor(residuals_packed[start:end]))
         
-        # 1. Full 128D -> Optimal 96D SVD Projection
         emb_128 = searcher.ranker.codec.decompress(obj).cuda().float()
         emb_96 = torch.nn.functional.normalize(emb_128 @ R_cuda, p=2, dim=-1).cpu().numpy()
         
-        # 2. Compute TRUE semantic energy directly from emb_96
         emb_reshaped = emb_96.reshape(-1, NUM_SUBSPACES, 3)
         emb_sq_norms = np.sum(emb_reshaped**2, axis=-1)
 
-        # 3. Select Top-M highest energy subspaces
         top_m_idx = np.argpartition(-emb_sq_norms, args.top_m, axis=-1)[:, :args.top_m]
-
-        # 4. Quantize residuals in active subspaces
         resid = emb_96 - centroids_96[codes[start:end]]
 
         for s in range(NUM_SUBSPACES):
@@ -104,7 +104,18 @@ def main():
                 _, eids = trees[s].query(sub_vecs)
                 all_eids[s, start:end][mask_s] = eids.astype(np.int16)
 
-        print(f"  Processed {end:,} / {total_tokens:,} tokens ({end / total_tokens * 100:.1f}%)")
+        if (start // CHUNK) % 10 == 0 or end == total_tokens:
+            print(f"  Processed {end:,} / {total_tokens:,} tokens ({end / total_tokens * 100:.1f}%)")
+
+    # Flush memory-mapped files to disk
+    all_eids.flush()
+    active_mask.flush()
+
+    # CRITICAL: Delete residual memory and searcher to free 25+ GB before sorting!
+    print("Freeing quantization memory...")
+    del residuals_packed, searcher, trees
+    gc.collect()
+    torch.cuda.empty_cache()
 
     print("\nCompiling Unified Full-Corpus CSR Tables...")
     all_row_ptrs, all_col_eids, all_offsets, all_lengths, all_packed = [], [], [], [], []
@@ -118,9 +129,6 @@ def main():
         pos_s  = pos_all[mask_s]
         num_s_tokens = len(cids_s)
 
-        # Sort by (cid, eid, pid): rows group (cid, eid); postings inside each row
-        # are additionally ordered by pid so the GPU can skip repeated pids
-        # for the same passage with a cheap cross-lane compare.
         sort_keys = (cids_s.astype(np.int64) << 40) | (eids_s.astype(np.int64) << 24) | pids_s.astype(np.int64)
         order = np.argsort(sort_keys, kind="stable")
 
@@ -146,12 +154,9 @@ def main():
         col_eids = unique_eids.astype(np.uint8)
         active_lengths = lengths_b.astype(np.uint16)
         active_offsets = (starts_b + curr_global_packed).astype(np.int64)
-        # Packing contract: (pid << 9) | position. Token positions MUST fit in 9
-        # bits; fail loudly at build time instead of silently corrupting pids.
+
         max_pos = int(pos_sorted.max()) if len(pos_sorted) else 0
-        assert max_pos < 512, (
-            f"token position {max_pos} does not fit in the 9-bit packing; "
-            "widen the packing before building")
+        assert max_pos < 512, f"token position {max_pos} exceeds 9 bits"
         packed_s = (pids_sorted.astype(np.int32) << 9) | pos_sorted.astype(np.int32)
 
         all_row_ptrs.append(row_ptrs)
@@ -162,6 +167,11 @@ def main():
 
         curr_global_col += len(col_eids)
         curr_global_packed += len(packed_s)
+
+        # Free per-subspace temporary arrays
+        del mask_s, cids_s, eids_s, pids_s, pos_s, sort_keys, order
+        del cids_sorted, eids_sorted, pids_sorted, pos_sorted
+        gc.collect()
 
     flat_row_ptrs = np.stack(all_row_ptrs)
     flat_col_eids = np.concatenate(all_col_eids)
@@ -175,12 +185,17 @@ def main():
     np.save(os.path.join(args.outdir, "csr_lengths.npy"), flat_lengths)
     np.save(os.path.join(args.outdir, "csr_packed.npy"), flat_packed)
 
+    # Clean up temporary memory-mapped files to reclaim disk space
+    del all_eids, active_mask
+    if os.path.exists(mmap_eids_path): os.remove(mmap_eids_path)
+    if os.path.exists(mmap_mask_path): os.remove(mmap_mask_path)
+
     meta_mb = (flat_row_ptrs.nbytes + flat_col_eids.nbytes + flat_offsets.nbytes + flat_lengths.nbytes) / 1e6
     packed_mb = flat_packed.nbytes / 1e6
-    print(f"\n[DONE] Full LoTTE CSR Index Compiled:")
-    print(f"  Total CSR Metadata  : {meta_mb:.2f} MB")
-    print(f"  Packed Postings     : {packed_mb:.2f} MB")
-    print(f"  Total VRAM Footprint: {(meta_mb + packed_mb)/1024:.2f} GB")
+    print(f"\n[DONE] CSR Index Compiled Successfully:")
+    print(f"  Metadata Footprint : {meta_mb:.2f} MB")
+    print(f"  Packed Postings    : {packed_mb:.2f} MB")
+    print(f"  Total Size         : {(meta_mb + packed_mb)/1024:.2f} GB")
 
 if __name__ == "__main__":
     main()
