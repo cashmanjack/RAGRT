@@ -246,9 +246,10 @@ def summary_md(R, out, metric_name):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", required=True, choices=list(C.DATASETS))
+    ap.add_argument("--results_subdir", default=None)
     args = ap.parse_args()
     ds = C.dataset(args.dataset)
-    out = ds["results_dir"]
+    out = os.path.join(ds["results_dir"], args.results_subdir) if args.results_subdir else ds["results_dir"]
     R = json.load(open(os.path.join(out, "results.json")))
     perq_path = os.path.join(out, "test_perquery.npz")
     perq = dict(np.load(perq_path)) if os.path.exists(perq_path) else {}

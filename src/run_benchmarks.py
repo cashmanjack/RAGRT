@@ -53,12 +53,16 @@ class Bench:
     def __init__(self, args):
         self.args = args
         self.ds = C.dataset(args.dataset)
+        if args.results_subdir:
+            self.ds["results_dir"] = os.path.join(self.ds["results_dir"], args.results_subdir)
         os.makedirs(self.ds["results_dir"], exist_ok=True)
         self.json_path = os.path.join(self.ds["results_dir"], "results.json")
         self.npz_path = os.path.join(self.ds["results_dir"], "test_perquery.npz")
         self.R = json.load(open(self.json_path)) if os.path.exists(self.json_path) else {}
         self.perq = dict(np.load(self.npz_path)) if os.path.exists(self.npz_path) else {}
 
+        if args.gt_path:
+            self.ds["gt_path"] = args.gt_path
         if not os.path.exists(self.ds["gt_path"]):
             sys.exit(f"FATAL: {self.ds['gt_path']} missing. Run build_ground_truth.py --dataset {args.dataset} first.")
         z = np.load(self.ds["gt_path"])
@@ -363,6 +367,8 @@ def main():
     ap.add_argument("--throughput_queries", type=int, default=1024)
     ap.add_argument("--targets", type=lambda s: [float(x) for x in s.split(",")], default=[0.80, 0.85, 0.90, 0.95, 0.98])
     ap.add_argument("--quick", action="store_true", help="tiny grids, for a smoke test")
+    ap.add_argument("--gt_path", default=None, help="ground truth file (default: the full one for the dataset)")
+    ap.add_argument("--results_subdir", default=None, help="write results to <results>/<dataset>/<subdir> (e.g. smoke)")
     args = ap.parse_args()
 
     b = Bench(args)
