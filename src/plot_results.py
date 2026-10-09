@@ -1,0 +1,272 @@
+"""
+Figures and a markdown summary from run_benchmarks.py output. Nothing is measured here.
+
+  python3 plot_results.py --dataset lotte
+
+Writes to <results>/<dataset>/: fig_pareto.png, fig_operating_point.png,
+fig_breakdown.png, fig_latency_cdf.png, fig_filtered.png, fig_throughput.png, summary.md
+"""
+import os, json, argparse
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.ticker
+
+import eval_config as C
+
+# Fixed per engine (color follows the entity). Validated palette slots 1-3; aqua is
+# below 3:1 contrast on white, so every series also has its own marker, a legend and
+# direct labels, and summary.md carries the numbers as a table.
+STYLE = {
+    "ragrt": {"color": "#2a78d6", "marker": "o", "label": "RAGRT"},
+    "plaid": {"color": "#eb6834", "marker": "s", "label": "PLAID"},
+    "ptms":  {"color": "#1baf7a", "marker": "D", "label": "PLAID+TMS"},
+}
+ENGINES = ["plaid", "ptms", "ragrt"]
+INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
+
+plt.rcParams.update({
+    "font.size": 9, "axes.edgecolor": INK2, "axes.labelcolor": INK, "xtick.color": INK2,
+    "ytick.color": INK2, "axes.spines.top": False, "axes.spines.right": False,
+    "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.6, "legend.frameon": False,
+    "lines.linewidth": 2.0, "savefig.dpi": 200, "savefig.bbox": "tight",
+})
+
+
+def save(fig, out, name):
+    fig.savefig(os.path.join(out, name))
+    plt.close(fig)
+    print(f"  wrote {name}")
+
+
+def fig_pareto(R, out, metric_name):
+    sweep, test, sel = R["sweep"], R.get("test", {}), R.get("selection", {})
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.8), layout="constrained")
+    for ax, qkey, ylabel in [(axes[0], "gt_r10", "Recall of exact top-10 (TUNE)"),
+                             (axes[1], "official", f"{metric_name} (TUNE)")]:
+        for e in ENGINES:
+            st = STYLE[e]
+            pts = sweep[e]
+            ax.scatter([p["lat_median"] for p in pts], [p[qkey] for p in pts], s=10,
+                       color=st["color"], alpha=0.25, linewidths=0)
+            front, best = [], -1
+            for p in sorted(pts, key=lambda p: p["lat_median"]):
+                if p[qkey] > best:
+                    front.append(p); best = p[qkey]
+            ax.plot([p["lat_median"] for p in front], [p[qkey] for p in front], color=st["color"],
+                    marker=st["marker"], markersize=4, label=st["label"])
+        ax.set_xscale("log")
+        ax.xaxis.set_major_formatter(matplotlib.ticker.FormatStrFormatter("%g"))
+        ax.xaxis.set_minor_formatter(matplotlib.ticker.FormatStrFormatter("%g"))
+        ax.set_xlabel("Retrieval latency, median ms (log)")
+        ax.set_ylabel(ylabel)
+        ax.legend(loc="lower right")
+    fig.suptitle("Quality vs latency over the TUNE sweep (curves = Pareto frontier)", color=INK)
+    save(fig, out, "fig_pareto.png")
+
+
+def fig_operating_point(R, out, metric_name):
+    target = R["primary_target"]
+    sel, test = R["selection"][target], R["test"]
+    engines = [e for e in ENGINES if sel.get(e)]
+    rows = [test[f"{e}|{sel[e]['key']}"] for e in engines]
+    fig, axes = plt.subplots(1, 3, figsize=(11, 3.4), layout="constrained")
+    x = np.arange(len(engines))
+    labels = [STYLE[e]["label"] for e in engines]
+    colors = [STYLE[e]["color"] for e in engines]
+    lat = [r["lat"]["median"] for r in rows]
+    axes[0].bar(x, lat, color=colors, width=0.6)
+    for i, v in enumerate(lat):
+        axes[0].text(i, v, f"{v:.2f} ms", ha="center", va="bottom", color=INK, fontsize=8)
+    axes[0].set_ylabel("Median retrieval latency (ms, TEST)")
+    for ax, k, yl in [(axes[1], "gt_r10", "Recall of exact top-10"), (axes[2], "official", metric_name)]:
+        m = [r[k]["mean"] for r in rows]
+        err = np.array([[r[k]["mean"] - r[k]["ci95"][0], r[k]["ci95"][1] - r[k]["mean"]] for r in rows]).T
+        ax.bar(x, m, color=colors, width=0.6, yerr=err, ecolor=INK2, capsize=3)
+        for i, v in enumerate(m):
+            ax.text(i, v, f"{v:.3f}", ha="center", va="bottom", color=INK, fontsize=8)
+        ax.set_ylabel(yl + " (TEST, 95% CI)")
+    for ax in axes:
+        ax.set_xticks(x); ax.set_xticklabels(labels); ax.grid(axis="x", visible=False)
+    fig.suptitle(f"Operating point: fastest TUNE config reaching PLAID-default quality "
+                 f"(exact R@10 >= {sel['target_gt_r10']:.3f})", color=INK)
+    save(fig, out, "fig_operating_point.png")
+
+
+def fig_breakdown(R, out):
+    b = R["breakdown"]
+    fig, ax = plt.subplots(figsize=(7, 3.6), layout="constrained")
+    bars = []
+    if "plaid" in b:
+        bars.append(("PLAID", [("Stages 1-3", b["plaid"]["s1_3"]), ("Stage 4 (est.)", b["plaid"]["s4_est"])]))
+    if "ptms" in b:
+        bars.append(("PLAID+TMS", [("Stages 1-3", b["ptms"]["s1_3"]), ("Stage 4 TMS", b["ptms"]["s4"])]))
+    if "ragrt" in b:
+        r = b["ragrt"]
+        bars.append(("RAGRT", [("0b prep", r["s0b_prep"]), ("1 RT", r["s1_rt"]), ("2 gather", r["s2_gather"]),
+                               ("3 score", r["s3_score"]), ("4 TMS", r["s4_tms"])]))
+    shades = ["#cde2fb", "#9ec5f4", "#6ba6ea", "#2a78d6", "#1c5299"]
+    longest = max(sum(v for _, v in segs) for _, segs in bars)
+    for i, (name, segs) in enumerate(bars):
+        left = 0.0
+        for j, (seg, v) in enumerate(segs):
+            ax.barh(i, v, left=left, color=shades[j % len(shades)], edgecolor="white", linewidth=2, height=0.55)
+            if v > 0.07 * longest:
+                ax.text(left + v / 2, i, f"{seg}\n{v:.2f}", ha="center", va="center", fontsize=7,
+                        color=INK if j < 2 else "white")
+            left += v
+        ax.text(left, i, f"  {left:.2f} ms", va="center", color=INK, fontsize=8)
+    ax.set_yticks(range(len(bars))); ax.set_yticklabels([n for n, _ in bars]); ax.invert_yaxis()
+    ax.set_xlabel("Median ms per query (TEST). Stage 0a query encoding, "
+                  f"{b['stage0a_encode_median']:.2f} ms, is common to all and excluded")
+    ax.grid(axis="y", visible=False)
+    save(fig, out, "fig_breakdown.png")
+
+
+def fig_latency_cdf(R, perq, out):
+    sel, test = R["selection"][R["primary_target"]], R["test"]
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.6), layout="constrained")
+    for e in ENGINES:
+        if not sel.get(e):
+            continue
+        k = f"{e}|{sel[e]['key']}"
+        lat = np.sort(perq[f"{k}|lat"])
+        st = STYLE[e]
+        axes[0].plot(lat, np.arange(1, len(lat) + 1) / len(lat), color=st["color"], label=st["label"])
+        ntok = perq[f"{k}|ntok"]
+        r = np.corrcoef(ntok, perq[f"{k}|lat"])[0, 1]
+        axes[1].scatter(ntok + (ENGINES.index(e) - 1) * 0.15, perq[f"{k}|lat"], s=8, color=st["color"],
+                        marker=st["marker"], alpha=0.35, linewidths=0, label=f"{st['label']} (r = {r:+.2f})")
+    axes[0].set_xlabel("Retrieval latency (ms)"); axes[0].set_ylabel("Fraction of TEST queries")
+    axes[0].legend(loc="lower right")
+    axes[1].set_xlabel("Query tokens (attention mask)"); axes[1].set_ylabel("Retrieval latency (ms)")
+    axes[1].legend(loc="upper left", markerscale=2)
+    save(fig, out, "fig_latency_cdf.png")
+
+
+def fig_filtered(R, out):
+    F = R["filtered"]
+    syn = [(int(k[3:]), k) for k in F if k.startswith("syn")]
+    syn.sort()
+    if not syn:
+        return
+    test, sel = R["test"], R["selection"][R["primary_target"]]
+    fig, axes = plt.subplots(1, 3, figsize=(12, 3.6), layout="constrained")
+    for e in ENGINES:
+        if e not in F[syn[0][1]]:
+            continue
+        st = STYLE[e]
+        xs = [p for p, _ in syn] + [100]
+        unf = test[f"{e}|{sel[e]['key']}"]
+        r10 = [F[k][e]["gt_r10"]["mean"] for _, k in syn] + [unf["gt_r10"]["mean"]]
+        lat = [F[k][e]["lat"]["median"] for _, k in syn] + [unf["lat"]["median"]]
+        starve = [F[k][e]["frac_under_10_results"] for _, k in syn] + [unf["frac_under_10_results"]]
+        for ax, ys in zip(axes, [r10, lat, starve]):
+            ax.plot(xs, ys, color=st["color"], marker=st["marker"], markersize=5, label=st["label"])
+    axes[0].set_ylabel("Recall of exact filtered top-10")
+    axes[1].set_ylabel("Median latency (ms)")
+    axes[2].set_ylabel("Fraction of queries with < 10 results")
+    for ax in axes:
+        ax.set_xscale("log"); ax.set_xticks([5, 14, 30, 60, 100]); ax.set_xticklabels(["5", "14", "30", "60", "100"])
+        ax.set_xlabel("Passages passing the filter (%)")
+    axes[0].legend(loc="lower right")
+    fig.suptitle("Synthetic filters (independent of relevance), primary operating point, TEST", color=INK)
+    save(fig, out, "fig_filtered.png")
+
+
+def fig_throughput(R, out):
+    T = R["throughput"]
+    fig, ax = plt.subplots(figsize=(6.5, 3.4), layout="constrained")
+    for e in ENGINES:
+        k = f"{e}_sequential_qps"
+        if k in T:
+            ax.axhline(T[k], color=STYLE[e]["color"], linewidth=1.5, linestyle="--")
+            ax.text(1, T[k], f" {STYLE[e]['label']} sequential {T[k]:.0f} QPS", va="bottom", fontsize=8, color=INK2)
+    if "ragrt_pipelined_qps" in T:
+        B = sorted(int(b) for b in T["ragrt_pipelined_qps"])
+        ax.plot(B, [T["ragrt_pipelined_qps"][str(b)] for b in B], color=STYLE["ragrt"]["color"],
+                marker="o", markersize=5, label="RAGRT pipelined (dual stream)")
+    ax.set_xscale("log", base=2); ax.set_xlabel("Queries per pipelined call")
+    ax.set_ylabel("Throughput (queries / s)")
+    ax.legend(loc="lower right")
+    ax.set_title(f"Throughput over {T['n_queries']} TEST queries (not latency)", color=INK)
+    save(fig, out, "fig_throughput.png")
+
+
+def summary_md(R, out, metric_name):
+    L = [f"# RAGRT results: {R['meta']['args']['dataset']}", "",
+         f"- {R['meta']['date']} on {R['meta']['gpu']}, git {R['meta']['git']}",
+         f"- queries: {R['split']['tune']:,} tune / {R['split']['test']:,} test (seeded hash split)",
+         f"- stage 0a query encoding (common to all engines): median {R['stage0a_encode']['median']:.2f} ms",
+         "", "## Operating points (TEST, 95% bootstrap CI)", "",
+         f"| target | engine | config | median ms | p99 ms | exact R@10 | {metric_name} |",
+         "|---|---|---|---|---|---|---|"]
+    for name, s in R.get("selection", {}).items():
+        for e in ENGINES:
+            if not s.get(e):
+                L.append(f"| {name} | {STYLE[e]['label']} | unreachable on TUNE | | | | |")
+                continue
+            t = R["test"].get(f"{e}|{s[e]['key']}")
+            if not t:
+                continue
+            ci = lambda m: f"{t[m]['mean']:.4f} [{t[m]['ci95'][0]:.4f}, {t[m]['ci95'][1]:.4f}]"
+            L.append(f"| {name} | {STYLE[e]['label']} | {s[e]['key']} | {t['lat']['median']:.2f} | "
+                     f"{t['lat']['p99']:.2f} | {ci('gt_r10')} | {ci('official')} |")
+    L += ["", "## RAGRT vs baselines at each target", "",
+          "| target | speedup vs PLAID | speedup vs PLAID+TMS | exact R@10 diff vs PLAID+TMS | "
+          f"{metric_name} diff vs PLAID+TMS |", "|---|---|---|---|---|"]
+    for name, c in R.get("comparisons", {}).items():
+        f = lambda k: f"{c[k]['mean']:+.4f} [{c[k]['ci95'][0]:+.4f}, {c[k]['ci95'][1]:+.4f}]" if k in c else "n/a"
+        sp = lambda k: f"{c[k]:.2f}x" if k in c else "n/a"
+        L.append(f"| {name} | {sp('speedup_vs_plaid')} | {sp('speedup_vs_ptms')} | "
+                 f"{f('gt_r10_diff_vs_ptms')} | {f('official_diff_vs_ptms')} |")
+    if "drops" in R:
+        L += ["", "## RAGRT silent drops (diagnostic pass, counters off during timing)", "",
+              "| config | rays > 128 hits | hits lost to cap | tasks dropped (MAX_TASKS) | MIN_BASE_SCORE drops |",
+              "|---|---|---|---|---|"]
+        for k, s in R["drops"].items():
+            L.append(f"| {k} | {s['frac_rays_overflow']:.2%} | {s['hits_lost_to_cap']:,} | "
+                     f"{s['frac_tasks_dropped']:.2%} | {s['min_score_drops']:,} |")
+    dpath = os.path.join(out, "dram.json")
+    if os.path.exists(dpath):
+        D = json.load(open(dpath))
+        L += ["", f"## DRAM per query (Nsight Compute, {D['n_queries']} TEST queries, calibrated)", "",
+              "| cache mode | calibration ratio | PLAID MB/q | PLAID+TMS MB/q | RAGRT MB/q |", "|---|---|---|---|---|"]
+        for mode in ("none", "all"):
+            m = D.get(f"cache_{mode}")
+            if m:
+                g = lambda e: f"{m[e]['mb_per_query_calibrated']:.1f}" if e in m else "n/a"
+                L.append(f"| {'warm (L2 kept)' if mode == 'none' else 'cold (L2 flushed per kernel)'} | "
+                         f"{m['calibration_ratio']:.3f} | {g('plaid')} | {g('ptms')} | {g('ragrt')} |")
+    open(os.path.join(out, "summary.md"), "w").write("\n".join(L) + "\n")
+    print("  wrote summary.md")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", required=True, choices=list(C.DATASETS))
+    args = ap.parse_args()
+    ds = C.dataset(args.dataset)
+    out = ds["results_dir"]
+    R = json.load(open(os.path.join(out, "results.json")))
+    perq_path = os.path.join(out, "test_perquery.npz")
+    perq = dict(np.load(perq_path)) if os.path.exists(perq_path) else {}
+    metric = ds["official_metric"].replace("mrr", "MRR").replace("success", "Success")
+    if "sweep" in R:
+        fig_pareto(R, out, metric)
+    if "test" in R and "selection" in R:
+        fig_operating_point(R, out, metric)
+        if perq:
+            fig_latency_cdf(R, perq, out)
+    if "breakdown" in R:
+        fig_breakdown(R, out)
+    if "filtered" in R and "test" in R:
+        fig_filtered(R, out)
+    if "throughput" in R:
+        fig_throughput(R, out)
+    summary_md(R, out, metric)
+
+
+if __name__ == "__main__":
+    main()

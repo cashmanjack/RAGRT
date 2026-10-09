@@ -20,7 +20,7 @@ echo "== Step 2: sparse CSR (24-bit pids, block sums)"
 python3 build_full_lotte_sparse_csr.py --index "$SYMLINK_DIR" --collection "$COLLECTION" \
     --outdir "$OUT_DIR" --top_m "$TOP_M"
 
-echo "== Step 3: synthetic predicates"
-python3 build_synthetic_predicates.py --outdir "$OUT_DIR" --num_passages 8841823
+echo "== Step 3: predicates (synthetic selectivity bits)"
+python3 build_predicates.py --outdir "$OUT_DIR" --num_passages 8841823
 
 echo "MS MARCO RAGRT index ready in $OUT_DIR"

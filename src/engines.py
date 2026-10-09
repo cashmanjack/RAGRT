@@ -1,0 +1,236 @@
+"""
+The three retrieval engines behind one interface, for benchmarks and profiling.
+
+  plaid  : stock ColBERTv2/PLAID (searcher.ranker.rank)
+  ptms   : PLAID stages 1-3, then fused TileMaxSim rerank
+  ragrt  : RT-core candidate generation + fused TileMaxSim rerank
+
+Every search takes an already-encoded query (Qf: [32, 128] fp16 on the GPU) and
+returns a python list of pids, best first. Query encoding (BERT) is common to all
+engines and timed separately as stage 0a. RAGRT's own query prep (128->96
+projection, centroid scores, top-nc) is stage 0b and is inside RAGRT's search.
+"""
+import os, sys
+from math import ceil
+import numpy as np
+import torch
+
+import eval_config as C
+sys.path.insert(0, C.BASE_DIR)
+sys.path.insert(0, C.COLBERT_DIR)
+
+from colbert import Searcher
+from colbert.search.strided_tensor import StridedTensor
+from colbert.modeling.colbert import colbert_score_reduce
+import rtrag_corr_3d
+import ragrt_index_lib as L
+
+NEG_INF = float("-inf")
+
+
+def plaid_cfg_key(p):
+    return f"nc={p['ncells']} th={p['threshold']} ndocs={p['ndocs']}"
+
+
+def ragrt_cfg_key(p):
+    return f"nc={p['nc']} eids={p['eids']} ndocs={p['ndocs']}"
+
+
+def cfg_key(engine, p):
+    return ragrt_cfg_key(p) if engine == "ragrt" else plaid_cfg_key(p)
+
+
+class Engines:
+    def __init__(self, ds, load_ragrt=True):
+        self.ds = ds
+        self.searcher = Searcher(index=ds["index"], collection=ds["collection"])
+        self.ranker = self.searcher.ranker
+        self.N = len(self.ranker.doclens)
+
+        codec = self.ranker.codec
+        doclens = torch.tensor(self.ranker.doclens, dtype=torch.int32, device="cuda")
+        self.doclens = doclens
+        self.doc_offsets = torch.cat([torch.zeros(1, dtype=torch.int64, device="cuda"),
+                                      torch.cumsum(doclens.to(torch.int64), dim=0)])
+        self.codes = self.ranker.embeddings.codes[:int(self.doc_offsets[-1])].cuda().to(torch.int32).contiguous()
+        self.residuals = self.ranker.embeddings.residuals[:int(self.doc_offsets[-1])].cuda().contiguous()
+        self.centroids_fp16 = codec.centroids.cuda().to(torch.float16).contiguous()
+        self.bucket_weights = codec.bucket_weights.cuda().to(torch.float16).contiguous()
+        self.reversed_bit_map = codec.reversed_bit_map.cuda().to(torch.uint8).contiguous()
+        self.decomp_table = codec.decompression_lookup_table.cuda().to(torch.uint8).contiguous()
+
+        pred = np.load(ds["predicates_path"])
+        assert len(pred) == self.N, f"{ds['predicates_path']} has {len(pred):,} rows, index has {self.N:,}"
+        self.pred_np = pred.astype(np.uint32)
+        self.pred_gpu = torch.from_numpy(self.pred_np.astype(np.int64)).cuda()
+
+        self.index = None
+        if load_ragrt:
+            self._load_ragrt()
+
+    # ------------------------------------------------------------------ setup
+    def _load_ragrt(self):
+        d = self.ds["sparse_csr_dir"]
+        ld = lambda n: np.load(os.path.join(d, n))
+        self.R = torch.from_numpy(ld("svd_rotation_128_to_96.npy")).cuda().float()
+        self.C96 = torch.from_numpy(ld("centroids_96d_svd.npy")).cuda().float()
+        self.index = rtrag_corr_3d.CorrIndex3D(C.PTX_PATH)
+        self.index.build(torch.tensor(ld("codebooks.npy"), dtype=torch.float32).contiguous(), 0.95, 4)
+        self.index.bind_index(
+            torch.from_numpy(ld("csr_row_ptrs.npy").astype(np.int32)).cuda(),
+            torch.from_numpy(ld("csr_col_eids.npy")).cuda(),
+            torch.from_numpy(ld("csr_block_sums_128.npy").astype(np.int64)).cuda(),
+            torch.from_numpy(ld("csr_lengths.npy")).cuda(),
+            torch.from_numpy(ld("csr_packed_24.npy")).cuda(),
+            self.doc_offsets[:self.N + 1], self.doclens[:self.N], self.codes, self.residuals,
+            self.centroids_fp16, self.bucket_weights, self.reversed_bit_map, self.decomp_table,
+            torch.from_numpy(self.pred_np.astype(np.int64)).cuda().to(torch.uint32), self.N, self.C96.shape[0])
+
+    # ------------------------------------------------------------ stage 0a
+    @torch.no_grad()
+    def encode(self, text):
+        """[32, 128] fp16 query matrix on the GPU, and the number of real tokens."""
+        Qf = self.searcher.encode(text).squeeze(0).cuda().to(torch.float16).contiguous()
+        assert Qf.shape == (32, 128), f"expected [32, 128] query, got {tuple(Qf.shape)}"
+        return Qf, L.query_ntok(self.searcher, text)
+
+    # ------------------------------------------------------------ helpers
+    def tms_scores(self, Qf, pids_i32):
+        return rtrag_corr_3d.native_tile_maxsim_fused_decomp(
+            Qf, pids_i32, self.doc_offsets, self.doclens, self.codes, self.residuals,
+            self.centroids_fp16, self.bucket_weights, self.reversed_bit_map, self.decomp_table)
+
+    def passes(self, pids_list, mask):
+        if not mask or not len(pids_list):
+            return pids_list
+        a = np.asarray(pids_list, dtype=np.int64)
+        return a[(self.pred_np[a] & mask) != 0].tolist()
+
+    def set_plaid(self, p):
+        cfg = self.searcher.config
+        cfg.ncells, cfg.centroid_score_threshold, cfg.ndocs = p["ncells"], p["threshold"], p["ndocs"]
+
+    # ------------------------------------------------------------ PLAID
+    @torch.no_grad()
+    def plaid(self, Qf, p, mask=0):
+        """Stock PLAID; a filter can only be applied after ranking (post-filter)."""
+        self.set_plaid(p)
+        pids, _ = self.ranker.rank(self.searcher.config, Qf.unsqueeze(0))
+        pids = pids.tolist() if torch.is_tensor(pids) else list(pids)
+        return self.passes(pids, mask)[:C.TOP_K]
+
+    @torch.no_grad()
+    def plaid_stage3(self, Qf, p):
+        self.set_plaid(p)
+        return get_stage3_pids(self.ranker, self.searcher.config, Qf.unsqueeze(0))
+
+    @torch.no_grad()
+    def ptms(self, Qf, p, mask=0):
+        """PLAID stages 1-3, post-filter the candidates, fused TileMaxSim rerank. All on GPU."""
+        cands = self.plaid_stage3(Qf, p).to(torch.int64)
+        if mask:
+            cands = cands[(self.pred_gpu[cands] & mask) != 0]
+        if cands.numel() == 0:
+            return []
+        cands = cands.to(torch.int32).contiguous()
+        s = self.tms_scores(Qf, cands)
+        top = torch.topk(s, min(C.TOP_K, cands.numel())).indices
+        return cands[top].tolist()
+
+    # ------------------------------------------------------------ RAGRT
+    @torch.no_grad()
+    def ragrt_prep(self, Qf, ntok, nc):
+        """Stage 0b: 3D sub-queries, 96D centroid scores and the top-nc centroids per token."""
+        Q96 = torch.nn.functional.normalize(Qf[:ntok].float() @ self.R, p=2, dim=-1)
+        Q_sub = Q96.view(ntok, L.NUM_SUBSPACES, L.SUBSPACE_DIM).contiguous()
+        scores = (Q96 @ self.C96.T).contiguous()
+        topc = scores.topk(k=nc, dim=-1).indices.to(torch.int32).contiguous()
+        return Q_sub, scores, topc
+
+    @torch.no_grad()
+    def ragrt(self, Qf, ntok, p, mask=0):
+        Q_sub, scores, topc = self.ragrt_prep(Qf, ntok, p["nc"])
+        out = self.index.search_single_query_native(
+            Qf.float(), Qf, Q_sub, topc, scores, p["nc"], p["ndocs"], C.TOP_K,
+            query_mask=mask, k_eids=p["eids"])
+        # If fewer than TOP_K candidates pass a very selective filter, topk would pad with
+        # failing pids (scored -inf); drop them.
+        return self.passes(out.tolist(), mask)
+
+    @torch.no_grad()
+    def ragrt_profiled(self, Qf, ntok, p):
+        """(pids, [s0b, s1, s2, s3, s4] ms). s0b by CUDA events around the prep."""
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record()
+        Q_sub, scores, topc = self.ragrt_prep(Qf, ntok, p["nc"])
+        e1.record()
+        out, st = self.index.search_single_query_profiled(
+            Qf.float(), Qf, Q_sub, topc, scores, p["nc"], p["ndocs"], C.TOP_K,
+            query_mask=0, k_eids=p["eids"])
+        torch.cuda.synchronize()
+        return out.tolist(), [e0.elapsed_time(e1)] + list(st)
+
+    @torch.no_grad()
+    def ragrt_pipelined(self, Qfs, ntoks, p, mask=0):
+        """Throughput path: prep every query, then the dual-stream pipelined search."""
+        preps = [self.ragrt_prep(q, n, p["nc"]) for q, n in zip(Qfs, ntoks)]
+        out = self.index.search_batch_pipelined(
+            [q.float() for q in Qfs], list(Qfs), [x[0] for x in preps], [x[2] for x in preps],
+            [x[1] for x in preps], p["nc"], p["ndocs"], C.TOP_K, query_mask=mask, k_eids=p["eids"])
+        return out
+
+    def search(self, engine, Qf, ntok, p, mask=0):
+        if engine == "plaid":
+            return self.plaid(Qf, p, mask)
+        if engine == "ptms":
+            return self.ptms(Qf, p, mask)
+        if engine == "ragrt":
+            return self.ragrt(Qf, ntok, p, mask)
+        raise ValueError(engine)
+
+
+def get_stage3_pids(ranker, config, Q):
+    """
+    PLAID stages 1-3, the same steps as ColBERT's IndexScorer.score_pids (GPU path):
+    candidate generation, pruned centroid interaction -> top ndocs, full centroid
+    interaction -> top ndocs // 4. (The pre-Oct-2026 copy skipped the middle cut and
+    the full re-score, so PLAID+TMS reranked a different candidate set than PLAID.)
+    """
+    with torch.inference_mode():
+        pids, centroid_scores = ranker.retrieve(config, Q)
+        if isinstance(pids, list):
+            pids = torch.tensor(pids, dtype=torch.int32, device="cuda")
+        batch_size = 2 ** 20
+        if centroid_scores is not None and ranker.use_gpu:
+            centroid_scores = centroid_scores.cuda()
+            idx = centroid_scores.max(-1).values >= config.centroid_score_threshold
+            approx_scores = []
+            for i in range(0, ceil(len(pids) / batch_size)):
+                pids_ = pids[i * batch_size: (i + 1) * batch_size]
+                codes_packed, codes_lengths = ranker.embeddings_strided.lookup_codes(pids_)
+                idx_ = idx[codes_packed.long()]
+                pruned_codes_strided = StridedTensor(idx_, codes_lengths, use_gpu=ranker.use_gpu)
+                pruned_codes_padded, pruned_codes_mask = pruned_codes_strided.as_padded_tensor()
+                pruned_codes_lengths = (pruned_codes_padded * pruned_codes_mask).sum(dim=1)
+                codes_packed_ = codes_packed[idx_]
+                approx_scores_ = centroid_scores[codes_packed_.long()]
+                if approx_scores_.shape[0] == 0:
+                    approx_scores.append(torch.zeros((len(pids_),), dtype=approx_scores_.dtype).cuda())
+                    continue
+                approx_scores_strided = StridedTensor(approx_scores_, pruned_codes_lengths, use_gpu=ranker.use_gpu)
+                approx_scores_padded, approx_scores_mask = approx_scores_strided.as_padded_tensor()
+                approx_scores_ = colbert_score_reduce(approx_scores_padded, approx_scores_mask, config)
+                approx_scores.append(approx_scores_)
+            approx_scores = torch.cat(approx_scores, dim=0)
+            if config.ndocs < len(approx_scores):
+                pids = pids[torch.topk(approx_scores, k=config.ndocs).indices]
+
+            # Re-score the survivors with the full (unpruned) centroid scores, keep ndocs // 4.
+            codes_packed, codes_lengths = ranker.embeddings_strided.lookup_codes(pids)
+            approx_scores = centroid_scores[codes_packed.long()]
+            approx_scores_strided = StridedTensor(approx_scores, codes_lengths, use_gpu=ranker.use_gpu)
+            approx_scores_padded, approx_scores_mask = approx_scores_strided.as_padded_tensor()
+            approx_scores = colbert_score_reduce(approx_scores_padded, approx_scores_mask, config)
+            if config.ndocs // 4 < len(approx_scores):
+                pids = pids[torch.topk(approx_scores, k=(config.ndocs // 4)).indices]
+        return pids

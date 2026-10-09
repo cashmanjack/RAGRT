@@ -46,6 +46,16 @@ extern "C" void launch_ragrt_fused_stage23_csr256(
 );
 
 extern "C" int   ragrt_dropped_task_count(int buf_idx);
+extern "C" void  launch_mask_failing_candidates(const int* d_cand_pids, int n, const uint32_t* d_doc_predicates,
+                                                uint32_t query_mask, float* d_scores, cudaStream_t stream);
+extern "C" void  ragrt_set_drop_stats(int enabled);
+extern "C" void  ragrt_reset_drop_stats();
+extern "C" void  ragrt_drop_stats(unsigned long long* out);
+static const char* DROP_STAT_NAMES[] = {
+    "launches", "rays", "rays_overflow", "hits_lost_to_cap", "combos", "combos_found",
+    "min_score_drops", "tasks", "tasks_dropped"
+};
+static const int NUM_DROP_STATS = 9;
 
 extern "C" void launch_tile_maxsim_fused_decomp(
     const void* d_Q, const int* d_pids, const int64_t* d_doc_offsets, const int* d_doc_lens,
@@ -59,7 +69,7 @@ extern "C" void launch_ragrt_stage2_only(
     const int* d_topc, const float* d_scores,
     int total_rays, int max_hits, int k_eids, int k_cent, int ntok, int num_centroids,
     const int* d_csr_row_ptrs, const uint8_t* d_csr_col_eids,
-    const int64_t* d_csr_block_sums, const uint16_t* d_csr_lengths,
+    const int64_t* d_csr_block_sums, const uint16_t* d_csr_lengths, int num_passages,
     int buf_idx, cudaStream_t stream
 );
 
@@ -334,6 +344,8 @@ public:
             b_bucket_weights.data_ptr(), b_reversed_bit_map.data_ptr<uint8_t>(), b_decomp_table.data_ptr<uint8_t>(),
             d_final_scores[0].data_ptr<float>(), 0
         );
+        launch_mask_failing_candidates(candidate_pids.data_ptr<int>(), k_candidates,
+            (const uint32_t*)b_doc_predicates.data_ptr(), query_mask, d_final_scores[0].data_ptr<float>(), 0);
 
         auto topk_final = torch::topk(d_final_scores[0].slice(0, 0, k_candidates), std::min(k_top, k_candidates));
         return candidate_pids.index({std::get<1>(topk_final)});
@@ -386,7 +398,7 @@ public:
             total_rays, 128, k_eids, k_cent, nq, b_num_centroids,
             b_csr_row_ptrs.data_ptr<int>(), (const uint8_t*)b_csr_col_eids.data_ptr(),
             b_csr_block_sums.data_ptr<int64_t>(), (const uint16_t*)b_csr_lengths.data_ptr(),
-            0, 0
+            (int)b_num_passages, 0, 0
         );
         cudaEventRecord(ev2, 0);
 
@@ -405,6 +417,8 @@ public:
             b_bucket_weights.data_ptr(), b_reversed_bit_map.data_ptr<uint8_t>(), b_decomp_table.data_ptr<uint8_t>(),
             d_final_scores[0].data_ptr<float>(), 0
         );
+        launch_mask_failing_candidates(candidate_pids.data_ptr<int>(), k_candidates,
+            (const uint32_t*)b_doc_predicates.data_ptr(), query_mask, d_final_scores[0].data_ptr<float>(), 0);
         auto topk_final = torch::topk(d_final_scores[0].slice(0, 0, k_candidates), std::min(k_top, k_candidates));
         cudaEventRecord(ev4, 0);
 
@@ -462,6 +476,9 @@ public:
             torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
         CUDA_CHECK(cudaMemcpy(d_params_batch.data_ptr(), h_params_all.data(), 
             num_queries * sizeof(CorrParams3D), cudaMemcpyHostToDevice));
+        // A pageable H2D cudaMemcpy can return before the DMA lands, and stream_cand is
+        // non-blocking (not ordered after the legacy default stream): wait explicitly.
+        CUDA_CHECK(cudaDeviceSynchronize());
 
         c10::cuda::CUDAStream c_stream_cand  = c10::cuda::getStreamFromExternal(stream_cand, 0);
         c10::cuda::CUDAStream c_stream_score = c10::cuda::getStreamFromExternal(stream_score, 0);
@@ -506,6 +523,9 @@ public:
                     b_bucket_weights.data_ptr(), b_reversed_bit_map.data_ptr<uint8_t>(), b_decomp_table.data_ptr<uint8_t>(),
                     d_final_scores[buf_idx].data_ptr<float>(), stream_score
                 );
+                launch_mask_failing_candidates(d_candidate_pids[buf_idx].data_ptr<int>(), k_candidates,
+                    (const uint32_t*)b_doc_predicates.data_ptr(), query_mask,
+                    d_final_scores[buf_idx].data_ptr<float>(), stream_score);
 
                 auto topk_final = torch::topk(d_final_scores[buf_idx].slice(0, 0, k_candidates), std::min(k_top, k_candidates));
                 auto final_ranked = d_candidate_pids[buf_idx].slice(0, 0, k_candidates).index({std::get<1>(topk_final)});
@@ -553,4 +573,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              pybind11::arg("Q_full_128_list"), pybind11::arg("Q_full_fp16_list"), pybind11::arg("Q_sub3d_list"), pybind11::arg("topc_list"), pybind11::arg("scores_list"),
              pybind11::arg("k_cent"), pybind11::arg("k_candidates"), pybind11::arg("k_top"), pybind11::arg("query_mask") = 0, pybind11::arg("k_eids") = 16);
     m.def("native_tile_maxsim_fused_decomp", &native_tile_maxsim_fused_decomp);
+    m.def("set_drop_stats", [](bool enabled) { ragrt_set_drop_stats(enabled ? 1 : 0); },
+          "Enable/disable the Stage-2 diagnostic counters (off by default; leave off for timing).");
+    m.def("reset_drop_stats", []() { ragrt_reset_drop_stats(); });
+    m.def("get_drop_stats", []() {
+        unsigned long long v[NUM_DROP_STATS];
+        ragrt_drop_stats(v);
+        pybind11::dict d;
+        for (int i = 0; i < NUM_DROP_STATS; ++i) d[DROP_STAT_NAMES[i]] = v[i];
+        return d;
+    }, "Cumulative counters since the last reset (all zero unless set_drop_stats(True)).");
 }

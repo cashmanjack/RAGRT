@@ -2,11 +2,25 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <math.h>
 
 #define MAX_TASKS 1048576
 #define NUM_3D_SUBSPACES 32
 #define MIN_BASE_SCORE 0.0f
 #define WARPS_PER_BLOCK 8
+
+// Diagnostic counters (cumulative until reset; only written when stats are enabled,
+// so timed runs are unaffected). Index meaning, also mirrored in ragrt_drop_stats():
+#define ST_LAUNCHES        0  // stage-2 launches (= queries)
+#define ST_RAYS            1  // rays processed (token x subspace)
+#define ST_RAYS_OVERFLOW   2  // rays with more positive hits than max_hits (first-N kept, not best-N)
+#define ST_HITS_LOST       3  // positive hits beyond max_hits, summed over rays
+#define ST_COMBOS          4  // (kept eid, probed centroid) pairs looked up in the CSR
+#define ST_COMBOS_FOUND    5  // ... whose posting list exists
+#define ST_MIN_SCORE_DROP  6  // ... found but dropped by MIN_BASE_SCORE
+#define ST_TASKS           7  // posting-list tasks emitted (incl. dropped)
+#define ST_TASKS_DROPPED   8  // tasks beyond MAX_TASKS (silently not scored before)
+#define ST_COUNT           9
 
 __device__ __forceinline__ void atomicMaxHalf(half* addr, half val) {
 #if __CUDA_ARCH__ >= 700
@@ -28,7 +42,8 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
     int total_rays, int max_hits, int k_eids, int k_cent, int ntok, int num_centroids,
     int* __restrict__ d_num_tasks, int* __restrict__ d_num_dropped,
     int* __restrict__ d_task_qt, int64_t* __restrict__ d_task_offset,
-    int* __restrict__ d_task_length, float* __restrict__ d_task_base_score
+    int* __restrict__ d_task_length, float* __restrict__ d_task_base_score,
+    unsigned long long* __restrict__ stats
 ) {
     __shared__ int   s_top_eid[WARPS_PER_BLOCK][64];
     __shared__ float s_top_val[WARPS_PER_BLOCK][64];
@@ -45,6 +60,14 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
     if (qt >= ntok) return;
 
     int n_hits = out_hit_count[warp_id];
+    if (stats && lane_id == 0) {
+        if (warp_id == 0) atomicAdd(&stats[ST_LAUNCHES], 1ULL);
+        atomicAdd(&stats[ST_RAYS], 1ULL);
+        if (n_hits > max_hits) {
+            atomicAdd(&stats[ST_RAYS_OVERFLOW], 1ULL);
+            atomicAdd(&stats[ST_HITS_LOST], (unsigned long long)(n_hits - max_hits));
+        }
+    }
     if (n_hits > max_hits) n_hits = max_hits;
     int want = (k_eids < n_hits) ? k_eids : n_hits;
     int base_hit = warp_id * max_hits;
@@ -112,6 +135,7 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
 
     // 3. Parallel CSR Lookups & Hierarchical Block-Offset Reconstruction
     int total_combos = nsel * k_cent;
+    if (stats && lane_id == 0) atomicAdd(&stats[ST_COMBOS], (unsigned long long)total_combos);
     int64_t s_row_base = (int64_t)s * (num_centroids + 1);
 
     for (int combo = lane_id; combo < total_combos; combo += 32) {
@@ -122,6 +146,7 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
         int cid = topc[qt * k_cent + c];
 
         int task_found = 0;
+        int list_found = 0, score_drop = 0;
         int64_t task_off = 0;
         int task_len = 0;
         float task_base = 0.0f;
@@ -142,7 +167,9 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
             if (found_idx >= 0) {
                 int length = (int)csr_lengths[found_idx];
                 if (length > 0) {
+                    list_found = 1;
                     float base_score = scores[qt * num_centroids + cid] + s_top_val[warp_in_block][h];
+                    if (!(base_score > MIN_BASE_SCORE)) score_drop = 1;
                     if (base_score > MIN_BASE_SCORE) {
                         task_found = 1;
 
@@ -166,6 +193,15 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
         // Warp-Aggregated AtomicAdd
         unsigned int active = __activemask();
         unsigned int mask   = __ballot_sync(active, task_found);
+        if (stats) {
+            unsigned int m_found = __ballot_sync(active, list_found);
+            unsigned int m_drop  = __ballot_sync(active, score_drop);
+            if (lane_id == __ffs(active) - 1) {
+                if (m_found) atomicAdd(&stats[ST_COMBOS_FOUND], (unsigned long long)__popc(m_found));
+                if (m_drop)  atomicAdd(&stats[ST_MIN_SCORE_DROP], (unsigned long long)__popc(m_drop));
+                if (mask)    atomicAdd(&stats[ST_TASKS], (unsigned long long)__popc(mask));
+            }
+        }
 
         if (task_found) {
             int leader = __ffs(mask) - 1;
@@ -187,6 +223,7 @@ __global__ void collect_posting_tasks_csr_warp_kernel(
                 d_task_base_score[my_task_idx] = task_base;
             } else {
                 atomicAdd(d_num_dropped, 1);
+                if (stats) atomicAdd(&stats[ST_TASKS_DROPPED], 1ULL);
             }
         }
     }
@@ -237,10 +274,17 @@ __global__ void cooperative_score_passages_csr_fp16_filtered_kernel(
 }
 
 __global__ void sum_passages_fp16_to_fp32_kernel(
-    const half* __restrict__ qt_pid_max_fp16, int ntok, int num_passages, float* __restrict__ passage_scores
+    const half* __restrict__ qt_pid_max_fp16, int ntok, int num_passages, float* __restrict__ passage_scores,
+    const uint32_t* __restrict__ doc_predicates, uint32_t query_mask
 ) {
     int pid = blockIdx.x * blockDim.x + threadIdx.x;
     if (pid >= num_passages) return;
+    // Without this, a filtered query with fewer hit passages than k_candidates fills the
+    // candidate list with arbitrary zero-score passages, including ones that fail the filter.
+    if (query_mask != 0 && (doc_predicates[pid] & query_mask) == 0) {
+        passage_scores[pid] = -1e30f;
+        return;
+    }
 
     float total = 0.0f;
     #pragma unroll 8
@@ -249,6 +293,58 @@ __global__ void sum_passages_fp16_to_fp32_kernel(
         if (val > 0.0f) total += val;
     }
     passage_scores[pid] = total;
+}
+
+// After TileMaxSim: candidates that fail the filter score -inf, so they rank last. If fewer
+// than k_top candidates pass, topk still returns some of them; the caller drops those.
+__global__ void mask_failing_candidates_kernel(
+    const int* __restrict__ cand_pids, int n, const uint32_t* __restrict__ doc_predicates,
+    uint32_t query_mask, float* __restrict__ scores
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if ((doc_predicates[cand_pids[i]] & query_mask) == 0) scores[i] = -INFINITY;
+}
+
+extern "C" void launch_mask_failing_candidates(
+    const int* d_cand_pids, int n, const uint32_t* d_doc_predicates, uint32_t query_mask,
+    float* d_scores, cudaStream_t stream
+) {
+    if (query_mask == 0 || n <= 0) return;
+    int threads = 256;
+    mask_failing_candidates_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(
+        d_cand_pids, n, d_doc_predicates, query_mask, d_scores);
+}
+
+static unsigned long long* g_d_stats = nullptr;
+static bool g_stats_enabled = false;
+
+static unsigned long long* stats_ptr() {
+    if (!g_stats_enabled) return nullptr;
+    if (!g_d_stats) {
+        cudaMalloc(&g_d_stats, ST_COUNT * sizeof(unsigned long long));
+        cudaMemset(g_d_stats, 0, ST_COUNT * sizeof(unsigned long long));
+        cudaDeviceSynchronize();   // zeroed before kernels on any (non-blocking) stream
+    }
+    return g_d_stats;
+}
+
+extern "C" void ragrt_set_drop_stats(int enabled) { g_stats_enabled = (enabled != 0); }
+
+extern "C" void ragrt_reset_drop_stats() {
+    if (g_d_stats) {
+        cudaDeviceSynchronize();
+        cudaMemset(g_d_stats, 0, ST_COUNT * sizeof(unsigned long long));
+        cudaDeviceSynchronize();
+    }
+}
+
+// Copies ST_COUNT counters into out (zeros if stats were never enabled).
+extern "C" void ragrt_drop_stats(unsigned long long* out) {
+    for (int i = 0; i < ST_COUNT; ++i) out[i] = 0ULL;
+    if (!g_d_stats) return;
+    cudaDeviceSynchronize();
+    cudaMemcpy(out, g_d_stats, ST_COUNT * sizeof(unsigned long long), cudaMemcpyDeviceToHost);
 }
 
 static bool g_buffers_allocated = false;
@@ -313,7 +409,8 @@ extern "C" void launch_ragrt_fused_stage23_csr256(
         d_csr_row_ptrs, d_csr_col_eids, d_csr_block_sums, d_csr_lengths,
         total_rays, max_hits, k_eids, k_cent, active_ntok, num_centroids,
         g_d_num_tasks[buf_idx], g_d_num_dropped_tasks[buf_idx],
-        g_d_task_qt[buf_idx], g_d_task_offset[buf_idx], g_d_task_length[buf_idx], g_d_task_base_score[buf_idx]
+        g_d_task_qt[buf_idx], g_d_task_offset[buf_idx], g_d_task_length[buf_idx], g_d_task_base_score[buf_idx],
+        stats_ptr()
     );
 
     int coop_blocks = 142;
@@ -325,7 +422,8 @@ extern "C" void launch_ragrt_fused_stage23_csr256(
 
     int pass_blocks = (num_passages + threads - 1) / threads;
     sum_passages_fp16_to_fp32_kernel<<<pass_blocks, threads, 0, stream>>>(
-        g_d_qt_pid_max_fp16[buf_idx], active_ntok, num_passages, d_passage_scores
+        g_d_qt_pid_max_fp16[buf_idx], active_ntok, num_passages, d_passage_scores,
+        d_doc_predicates, query_mask
     );
 }
 
@@ -334,10 +432,10 @@ extern "C" void launch_ragrt_stage2_only(
     const int* d_topc, const float* d_scores,
     int total_rays, int max_hits, int k_eids, int k_cent, int ntok, int num_centroids,
     const int* d_csr_row_ptrs, const uint8_t* d_csr_col_eids,
-    const int64_t* d_csr_block_sums, const uint16_t* d_csr_lengths,
+    const int64_t* d_csr_block_sums, const uint16_t* d_csr_lengths, int num_passages,
     int buf_idx, cudaStream_t stream
 ) {
-    ensure_alloc(g_allocated_passages > 0 ? g_allocated_passages : 2430000);
+    ensure_alloc(num_passages);   // was a hard-coded 2,430,000 (LoTTE): overflowed on MS MARCO
     int active_ntok = (ntok <= 32) ? ntok : 32;
 
     cudaMemsetAsync(g_d_num_tasks[buf_idx], 0, sizeof(int), stream);
@@ -351,7 +449,8 @@ extern "C" void launch_ragrt_stage2_only(
         d_csr_row_ptrs, d_csr_col_eids, d_csr_block_sums, d_csr_lengths,
         total_rays, max_hits, k_eids, k_cent, active_ntok, num_centroids,
         g_d_num_tasks[buf_idx], g_d_num_dropped_tasks[buf_idx],
-        g_d_task_qt[buf_idx], g_d_task_offset[buf_idx], g_d_task_length[buf_idx], g_d_task_base_score[buf_idx]
+        g_d_task_qt[buf_idx], g_d_task_offset[buf_idx], g_d_task_length[buf_idx], g_d_task_base_score[buf_idx],
+        stats_ptr()
     );
 }
 
@@ -373,7 +472,8 @@ extern "C" void launch_ragrt_stage3_only(
 
     int pass_blocks = (num_passages + threads - 1) / threads;
     sum_passages_fp16_to_fp32_kernel<<<pass_blocks, threads, 0, stream>>>(
-        g_d_qt_pid_max_fp16[buf_idx], active_ntok, num_passages, d_passage_scores
+        g_d_qt_pid_max_fp16[buf_idx], active_ntok, num_passages, d_passage_scores,
+        d_doc_predicates, query_mask
     );
 }
 

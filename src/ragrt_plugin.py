@@ -31,7 +31,7 @@ def _load(sparse_csr_dir, name, dtype=None):
 
 class RAGRTPlugin:
     def __init__(self, searcher, sparse_csr_dir, ptx_path=PTX_PATH,
-                 predicates_file="doc_predicates.npy"):
+                 predicates_file="predicates.npy"):
         self.searcher = searcher
         self.scorer = FastTileMaxSimScorer(searcher)
         self.num_passages = len(searcher.ranker.doclens)

@@ -32,8 +32,10 @@ def check(d):
     cb = np.load(os.path.join(d, "codebooks.npy"))
     meta = json.load(open(os.path.join(d, "codebook_meta.json")))
     R = np.load(os.path.join(d, "svd_rotation_128_to_96.npy"))
-    preds = np.load(os.path.join(d, "synthetic_predicates.npy"), mmap_mode="r")
-    num_passages = len(preds)
+    pred_file = next((f for f in ("predicates.npy", "synthetic_predicates.npy")
+                      if os.path.exists(os.path.join(d, f))), None)
+    assert pred_file, "no predicates.npy in the index directory (run build_predicates.py)"
+    num_passages = len(np.load(os.path.join(d, pred_file), mmap_mode="r"))
 
     n_lists = len(lengths)
     n_post = len(packed) // 3
