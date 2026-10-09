@@ -45,13 +45,6 @@ extern "C" void launch_ragrt_fused_stage23_csr256(
     int buf_idx, cudaStream_t stream
 );
 
-extern "C" void launch_rt_maxsim_rescore_from_approx(
-    const void* d_approx, const int* d_pids,
-    int num_cands, int ntok, int num_passages,
-    float* d_out_scores, cudaStream_t stream
-);
-
-extern "C" half* ragrt_approx_score_buffer(int buf_idx);
 extern "C" int   ragrt_dropped_task_count(int buf_idx);
 
 extern "C" void launch_tile_maxsim_fused_decomp(
@@ -287,7 +280,7 @@ public:
 
     torch::Tensor search_single_query_native(
         torch::Tensor Q_full_128_fp32, torch::Tensor Q_full_fp16, torch::Tensor Q_sub3d, torch::Tensor topc, torch::Tensor scores,
-        int k_cent, int k_candidates, int k_top, int maxsim_backend = 0, uint32_t query_mask = 0, int k_eids = 16
+        int k_cent, int k_candidates, int k_top, uint32_t query_mask = 0, int k_eids = 16
     ) {
         TORCH_CHECK(is_bound, "Index must be bound before search!");
         int nq = (int)Q_sub3d.size(0);
@@ -335,20 +328,12 @@ public:
         auto topk_cands = torch::topk(d_passage_scores[0], k_candidates);
         auto candidate_pids = std::get<1>(topk_cands).to(torch::kInt32).contiguous();
 
-        if (maxsim_backend == 0) {
-            launch_tile_maxsim_fused_decomp(
-                Q_full_fp16.data_ptr(), candidate_pids.data_ptr<int>(), b_doc_offsets.data_ptr<int64_t>(), b_doc_lens.data_ptr<int>(),
-                k_candidates, b_codes.data_ptr<int>(), b_residuals.data_ptr<uint8_t>(), b_centroids_128.data_ptr(),
-                b_bucket_weights.data_ptr(), b_reversed_bit_map.data_ptr<uint8_t>(), b_decomp_table.data_ptr<uint8_t>(),
-                d_final_scores[0].data_ptr<float>(), 0
-            );
-        } else {
-            launch_rt_maxsim_rescore_from_approx(
-                ragrt_approx_score_buffer(0), candidate_pids.data_ptr<int>(),
-                k_candidates, nq, (int)b_num_passages,
-                d_final_scores[0].data_ptr<float>(), 0
-            );
-        }
+        launch_tile_maxsim_fused_decomp(
+            Q_full_fp16.data_ptr(), candidate_pids.data_ptr<int>(), b_doc_offsets.data_ptr<int64_t>(), b_doc_lens.data_ptr<int>(),
+            k_candidates, b_codes.data_ptr<int>(), b_residuals.data_ptr<uint8_t>(), b_centroids_128.data_ptr(),
+            b_bucket_weights.data_ptr(), b_reversed_bit_map.data_ptr<uint8_t>(), b_decomp_table.data_ptr<uint8_t>(),
+            d_final_scores[0].data_ptr<float>(), 0
+        );
 
         auto topk_final = torch::topk(d_final_scores[0].slice(0, 0, k_candidates), std::min(k_top, k_candidates));
         return candidate_pids.index({std::get<1>(topk_final)});
@@ -356,7 +341,7 @@ public:
 
     std::tuple<torch::Tensor, std::vector<float>> search_single_query_profiled(
         torch::Tensor Q_full_128_fp32, torch::Tensor Q_full_fp16, torch::Tensor Q_sub3d, torch::Tensor topc, torch::Tensor scores,
-        int k_cent, int k_candidates, int k_top, int maxsim_backend = 0, uint32_t query_mask = 0, int k_eids = 16
+        int k_cent, int k_candidates, int k_top, uint32_t query_mask = 0, int k_eids = 16
     ) {
         TORCH_CHECK(is_bound, "Index must be bound before search!");
         int nq = (int)Q_sub3d.size(0);
@@ -443,7 +428,7 @@ public:
         std::vector<torch::Tensor> topc_list,
         std::vector<torch::Tensor> scores_list,
         int k_cent, int k_candidates, int k_top,
-        int maxsim_backend = 0, uint32_t query_mask = 0, int k_eids = 16
+        uint32_t query_mask = 0, int k_eids = 16
     ) {
         TORCH_CHECK(is_bound, "Index must be bound before search!");
         ensure_cand_capacity(k_candidates);
@@ -560,12 +545,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("bind_index", &CorrIndex3D::bind_index)
         .def("search_single_query_profiled", &CorrIndex3D::search_single_query_profiled,
              pybind11::arg("Q_full_128_fp32"), pybind11::arg("Q_full_fp16"), pybind11::arg("Q_sub3d"), pybind11::arg("topc"), pybind11::arg("scores"),
-             pybind11::arg("k_cent"), pybind11::arg("k_candidates"), pybind11::arg("k_top"), pybind11::arg("maxsim_backend") = 0, pybind11::arg("query_mask") = 0, pybind11::arg("k_eids") = 16)     
+             pybind11::arg("k_cent"), pybind11::arg("k_candidates"), pybind11::arg("k_top"), pybind11::arg("query_mask") = 0, pybind11::arg("k_eids") = 16)     
         .def("search_single_query_native", &CorrIndex3D::search_single_query_native,
              pybind11::arg("Q_full_128_fp32"), pybind11::arg("Q_full_fp16"), pybind11::arg("Q_sub3d"), pybind11::arg("topc"), pybind11::arg("scores"),
-             pybind11::arg("k_cent"), pybind11::arg("k_candidates"), pybind11::arg("k_top"), pybind11::arg("maxsim_backend") = 0, pybind11::arg("query_mask") = 0, pybind11::arg("k_eids") = 16)
+             pybind11::arg("k_cent"), pybind11::arg("k_candidates"), pybind11::arg("k_top"), pybind11::arg("query_mask") = 0, pybind11::arg("k_eids") = 16)
         .def("search_batch_pipelined", &CorrIndex3D::search_batch_pipelined,
              pybind11::arg("Q_full_128_list"), pybind11::arg("Q_full_fp16_list"), pybind11::arg("Q_sub3d_list"), pybind11::arg("topc_list"), pybind11::arg("scores_list"),
-             pybind11::arg("k_cent"), pybind11::arg("k_candidates"), pybind11::arg("k_top"), pybind11::arg("maxsim_backend") = 0, pybind11::arg("query_mask") = 0, pybind11::arg("k_eids") = 16);
+             pybind11::arg("k_cent"), pybind11::arg("k_candidates"), pybind11::arg("k_top"), pybind11::arg("query_mask") = 0, pybind11::arg("k_eids") = 16);
     m.def("native_tile_maxsim_fused_decomp", &native_tile_maxsim_fused_decomp);
 }

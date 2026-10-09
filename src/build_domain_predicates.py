@@ -1,6 +1,8 @@
 import os, numpy as np
 
-SPARSE_CSR_DIR = "/local/scratch/a/cashman3/juno_pq_lotte_full_sparse8"
+import argparse
+ap = argparse.ArgumentParser(); ap.add_argument("--outdir", default="/local/scratch/a/cashman3/juno_pq_lotte_full_sparse8")
+SPARSE_CSR_DIR = ap.parse_args().outdir
 TOTAL_PASSAGES = 2428854
 
 print("=" * 80)

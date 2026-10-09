@@ -1,44 +1,32 @@
 """
-Build Synthetic Predicate Masks for Filtered Retrieval Scaling
-Target selectivities: [5%, 14%, 30%, 60%, 100%]
-Seed: 42 (Recorded and deterministic)
-Saved as synthetic_predicates.npy in /local/scratch/a/cashman3/juno_pq_lotte_full_sparse8/
+Synthetic predicate bitmasks for selectivity sweeps (independent of relevance).
+  bit 0: 5%   bit 1: 14%   bit 2: 30%   bit 3: 60%   bit 4: 100%
+Usage: python3 build_synthetic_predicates.py --outdir <sparse dir> --num_passages N [--seed 42]
 """
-import os
+import os, argparse
 import numpy as np
 
-SPARSE_CSR_DIR = "/local/scratch/a/cashman3/juno_pq_lotte_full_sparse8"
-TOTAL_PASSAGES = 2428854
-SEED = 42
+SELECTIVITIES = [0.05, 0.14, 0.30, 0.60]
 
-np.random.seed(SEED)
 
-TARGET_SELECTIVITIES = [0.05, 0.14, 0.30, 0.60]
-predicates = np.zeros(TOTAL_PASSAGES, dtype=np.uint32)
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--outdir", required=True)
+    ap.add_argument("--num_passages", type=int, required=True)
+    ap.add_argument("--seed", type=int, default=42)
+    args = ap.parse_args()
 
-print("=" * 70)
-print(f"GENERATING SYNTHETIC PREDICATE MASKS (Seed: {SEED})")
-print("=" * 70)
+    rng = np.random.default_rng(args.seed)
+    pred = np.zeros(args.num_passages, dtype=np.uint32)
+    for bit, sel in enumerate(SELECTIVITIES):
+        m = rng.random(args.num_passages) < sel
+        pred[m] |= np.uint32(1 << bit)
+        print(f"  bit {bit}: target {sel:.0%}, actual {m.mean():.2%}")
+    pred |= np.uint32(1 << len(SELECTIVITIES))
+    out = os.path.join(args.outdir, "synthetic_predicates.npy")
+    np.save(out, pred)
+    print(f"Saved {out} ({args.num_passages:,} passages, seed {args.seed})")
 
-# Bit 0: 5% selectivity
-# Bit 1: 14% selectivity
-# Bit 2: 30% selectivity
-# Bit 3: 60% selectivity
-# Bit 4: 100% selectivity (all ones for sanity check)
 
-for bit_idx, target_sel in enumerate(TARGET_SELECTIVITIES):
-    mask_bool = np.random.rand(TOTAL_PASSAGES) < target_sel
-    actual_sel = mask_bool.mean()
-    predicates[mask_bool] |= (1 << bit_idx)
-    print(f"  Bit {bit_idx}: Target = {target_sel * 100:4.1f}%, Actual = {actual_sel * 100:5.2f}% ({(predicates & (1 << bit_idx) != 0).sum():,} passages)")
-
-# Bit 4: 100% selectivity (all ones)
-predicates |= (1 << 4)
-print(f"  Bit 4: Target = 100.0%, Actual = 100.00% ({TOTAL_PASSAGES:,} passages)")
-
-out_path = os.path.join(SPARSE_CSR_DIR, "synthetic_predicates.npy")
-np.save(out_path, predicates)
-
-print(f"\nSaved synthetic predicates to: {out_path}")
-print(f"Array size: {predicates.nbytes / 1e6:.2f} MB (Fits entirely in L2 cache)")
-print("=" * 70)
+if __name__ == "__main__":
+    main()

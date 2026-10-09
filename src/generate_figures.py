@@ -85,6 +85,7 @@ from fast_tilemaxsim_scorer import FastTileMaxSimScorer
 from colbert.search.strided_tensor import StridedTensor
 from colbert.modeling.colbert import colbert_score_reduce
 import rtrag_corr_3d
+import ragrt_index_lib as L
 
 
 def median_lat_seq(fn, warmup=5, timed=15):
@@ -201,7 +202,7 @@ def setup_engines():
     centroids_96   = torch.from_numpy(np.load(os.path.join(SPARSE_CSR_DIR, "centroids_96d_svd.npy"))).cuda().float()
     R_proj         = torch.from_numpy(np.load(os.path.join(SPARSE_CSR_DIR, "svd_rotation_128_to_96.npy"))).cuda().float()
 
-    native_pred_path = os.path.join(SPARSE_CSR_DIR, "doc_predicates.npy")
+    native_pred_path = os.path.join(SPARSE_CSR_DIR, DATASETS[ACTIVE_DATASET]["predicates_file"])
     doc_predicates = torch.from_numpy(np.load(native_pred_path).astype(np.int64)).cuda()
 
     synth_pred_path = os.path.join(SPARSE_CSR_DIR, "synthetic_predicates.npy")
@@ -224,7 +225,7 @@ def setup_engines():
     Q_batches, Q_full_128_list, Q_full_fp16_list, Q_sub3d_list, topc_list, scores_list, q_ntoks = [], [], [], [], [], [], []
     for qid, q in eval_qs:
         Qf = searcher.encode(q).squeeze(0).cuda()
-        ntok = min(len(q.split()) + 4, 32)
+        ntok = L.query_ntok(q)
         q_ntoks.append(ntok)
         Q_act = Qf[:ntok, :].contiguous()
         Q_96 = torch.nn.functional.normalize(Q_act @ R_proj, p=2, dim=-1)
@@ -343,7 +344,7 @@ def run_combined_pareto_frontier(env):
                 def run_pipe():
                     return unified_idx.search_batch_pipelined(
                         Q_full_128_list[:bs], Q_full_fp16_list[:bs], Q_sub3d_list[:bs],
-                        topc_bs, scores_list[:bs], nc, ndocs, TOP_K, 0, 0, eids)
+                        topc_bs, scores_list[:bs], nc, ndocs, TOP_K, query_mask=0, k_eids=eids)
                 for _ in range(2): run_pipe()
                 torch.cuda.synchronize()
                 t0 = time.perf_counter(); run_pipe(); torch.cuda.synchronize()
@@ -352,7 +353,7 @@ def run_combined_pareto_frontier(env):
                 topc_full = [t[:, :nc].contiguous() for t in topc_list]
                 ranked_all = unified_idx.search_batch_pipelined(
                     Q_full_128_list, Q_full_fp16_list, Q_sub3d_list,
-                    topc_full, scores_list, nc, ndocs, TOP_K, 0, 0, eids)
+                    topc_full, scores_list, nc, ndocs, TOP_K, query_mask=0, k_eids=eids)
                 recs, mrrs = [], []
                 for i in range(num_eval):
                     ranked = ranked_all[i].cpu().tolist()
@@ -543,14 +544,14 @@ def run_standard_benchmark(env, selected_configs):
         for _ in range(NUM_WARMUP):
             _ = unified_idx.search_single_query_profiled(
                 Q_full_128_list[i], Q_full_fp16_list[i], Q_sub3d_list[i], topc_r[i], scores_list[i],
-                nc_r, ndocs_r, TOP_K, 0, 0, eids_r)
+                nc_r, ndocs_r, TOP_K, query_mask=0, k_eids=eids_r)
         torch.cuda.synchronize()
         q_lats = []
         for _ in range(NUM_TIMED_RUNS):
             torch.cuda.synchronize(); t0 = time.perf_counter()
             ranked_tensor, stages = unified_idx.search_single_query_profiled(
                 Q_full_128_list[i], Q_full_fp16_list[i], Q_sub3d_list[i], topc_r[i], scores_list[i],
-                nc_r, ndocs_r, TOP_K, 0, 0, eids_r)
+                nc_r, ndocs_r, TOP_K, query_mask=0, k_eids=eids_r)
             torch.cuda.synchronize()
             q_lats.append((time.perf_counter() - t0) * 1000)
             r_s1_l.append(stages[0]); r_s2_l.append(stages[1]); r_s3_l.append(stages[2]); r_s4_l.append(stages[3])
@@ -804,7 +805,7 @@ def run_filtered_benchmark(env, selected_configs):
                 torch.cuda.synchronize(); t0 = time.perf_counter()
                 ranked_tensor = unified_idx.search_single_query_native(
                     Q_full_128_list[i], Q_full_fp16_list[i], Q_sub3d_list[i], topc_r[i], scores_list[i],
-                    nc_r, ndocs_r, TOP_K, 0, mask_val, eids_r)
+                    nc_r, ndocs_r, TOP_K, query_mask=mask_val, k_eids=eids_r)
                 torch.cuda.synchronize()
                 q_lats.append((time.perf_counter() - t0) * 1000)
             rf_lats.append(float(np.median(q_lats)))
@@ -935,7 +936,7 @@ def run_concurrency_scaling(env, selected_configs):
         def run_ragrt():
             return unified_idx.search_batch_pipelined(
                 B_Q_full_128, B_Q_full_fp16, B_Q_sub3d, B_topc, B_scores,
-                nc_r, ndocs_r, TOP_K, 0, 0, eids_r)
+                nc_r, ndocs_r, TOP_K, query_mask=0, k_eids=eids_r)
 
         for _ in range(3): run_ragrt()
         torch.cuda.synchronize()
@@ -1131,7 +1132,7 @@ def run_selectivity_sweep(env, selected_configs):
                     torch.cuda.synchronize(); t0 = time.perf_counter()
                     ranked_tensor = unified_idx.search_single_query_native(
                         Q_full_128_list[i], Q_full_fp16_list[i], Q_sub3d_list[i], topc_r[i], scores_list[i],
-                        nc_r, ndocs_r, TOP_K, 0, mask_bit, eids_r)
+                        nc_r, ndocs_r, TOP_K, query_mask=mask_bit, k_eids=eids_r)
                     torch.cuda.synchronize()
                     q_lats.append((time.perf_counter() - t0) * 1000)
                 r_lats.append(float(np.median(q_lats)))

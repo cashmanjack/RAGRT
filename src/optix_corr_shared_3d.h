@@ -12,6 +12,5 @@ struct CorrParams3D {
     int*    out_hit_centroid;
     float*  out_hit_value;
     int*    out_hit_count;
-    float*  rt_table;
     int     max_hits;
 };

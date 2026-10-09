@@ -1,7 +1,20 @@
-import os, sys, shutil, torch, numpy as np, argparse, gc
-from scipy.spatial import cKDTree
+"""
+Build the RAGRT sparse CSR index for one ColBERT index (LoTTE, MS MARCO, ...).
 
-BASE_DIR = "/home/min/a/cashman3/RTRAG/src"
+Requires codebooks trained for THIS index by train_codebooks.py (same outdir).
+The rotation fingerprint and top_m recorded by the trainer are checked here, so
+codebooks from another index or another rotation are rejected.
+
+Writes csr_row_ptrs, csr_col_eids, csr_lengths, csr_block_sums_128 and
+csr_packed_24 directly (see ragrt_index_lib.py for the format). Token positions
+are not stored: the runtime never reads them.
+"""
+import os, sys, json, argparse, gc
+import numpy as np
+import torch
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE_DIR)
 sys.path.insert(0, os.path.join(BASE_DIR, "../reference/colbert-plaid"))
 
 from colbert import Searcher
@@ -9,193 +22,147 @@ from colbert.indexing.loaders import load_doclens
 from colbert.indexing.codecs.residual_embeddings import ResidualEmbeddings
 from colbert.utils.utils import flatten
 
-NUM_SUBSPACES = 32
-NUM_ENTRIES   = 256
-CHUNK         = 2_000_000
+import ragrt_index_lib as L
+
+CHUNK = 2_000_000
+
+
+def load_matching_codebooks(outdir, R, top_m):
+    cb_path = os.path.join(outdir, "codebooks.npy")
+    meta_path = os.path.join(outdir, "codebook_meta.json")
+    if not (os.path.exists(cb_path) and os.path.exists(meta_path)):
+        sys.exit(f"FATAL: {cb_path} / codebook_meta.json missing. Run train_codebooks.py "
+                 f"for this index with --outdir {outdir} first.")
+    meta = json.load(open(meta_path))
+    fp = L.rotation_fingerprint(R)
+    if meta.get("rotation_sha256") != fp:
+        sys.exit("FATAL: codebooks were trained in a different 128->96 rotation than this "
+                 "index uses. Retrain with train_codebooks.py.")
+    if meta.get("top_m") != top_m:
+        sys.exit(f"FATAL: codebooks trained with top_m={meta.get('top_m')}, building with "
+                 f"top_m={top_m}. They must match.")
+    codebooks = np.load(cb_path).astype(np.float32)
+    S, E, D = codebooks.shape
+    assert S == L.NUM_SUBSPACES and D == L.SUBSPACE_DIM, f"bad codebook shape {codebooks.shape}"
+    assert E <= L.MAX_EIDS_UINT8, (f"E={E} > 256: csr_col_eids is uint8 and the kernels "
+                                   f"assume 256 entries; widen them before building.")
+    return codebooks
+
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--index", default="/home/min/a/cashman3/RTRAG/src/experiments/unified_lotte/indexes/unified.dev.2bit")
-    ap.add_argument("--collection", default="/local/scratch/a/cashman3/lotte/unified/collection.tsv")
-    ap.add_argument("--outdir", default="/local/scratch/a/cashman3/juno_pq_lotte_full_sparse8")
-    ap.add_argument("--top_m", type=int, default=10, help="Top-M subspaces (M=10 recovers full recall)")
+    ap.add_argument("--index", required=True)
+    ap.add_argument("--collection", required=True)
+    ap.add_argument("--outdir", required=True)
+    ap.add_argument("--top_m", type=int, default=10)
     args = ap.parse_args()
-
     os.makedirs(args.outdir, exist_ok=True)
-    print("=" * 90)
-    print(f"BUILDING SPARSE CSR INDEX (Top-{args.top_m})")
-    print(f"Index : {args.index}")
-    print(f"Outdir: {args.outdir}")
-    print("=" * 90)
 
     print(f"Loading searcher from {args.index}...")
     searcher = Searcher(index=args.index, collection=args.collection)
-    
-    centroids_128 = searcher.ranker.codec.centroids.detach().cpu().float()
-    MAX_CID = centroids_128.shape[0]
+    centroids_128 = searcher.ranker.codec.centroids.detach().cpu().float().numpy()
+    num_centroids = centroids_128.shape[0]
 
     rot_path = os.path.join(args.outdir, "svd_rotation_128_to_96.npy")
-    if os.path.exists(rot_path):
-        print("Using existing SVD rotation matrix R...")
-        R = torch.from_numpy(np.load(rot_path)).float()
-    else:
-        print("Computing SVD projection matrix R...")
-        centered = centroids_128 - centroids_128.mean(dim=0, keepdim=True)
-        _, S, Vh = torch.linalg.svd(centered, full_matrices=False)
-        R = Vh[:96, :].T.contiguous().float()
-        np.save(rot_path, R.numpy())
+    if not os.path.exists(rot_path):
+        sys.exit(f"FATAL: {rot_path} missing. train_codebooks.py creates it; run that first.")
+    R = np.load(rot_path).astype(np.float32)
+    codebooks = load_matching_codebooks(args.outdir, R, args.top_m)
 
-    centroids_96 = torch.nn.functional.normalize(centroids_128.cuda() @ R.cuda(), p=2, dim=-1).cpu().numpy()
+    centroids_96 = L.l2_normalize(centroids_128 @ R)
     np.save(os.path.join(args.outdir, "centroids_96d_svd.npy"), centroids_96)
 
     codes = searcher.ranker.embeddings.codes.numpy()
     residuals_packed = searcher.ranker.embeddings.residuals.numpy()
     total_tokens = codes.shape[0]
-    print(f"Corpus: {total_tokens:,} tokens | Coarse Centroids: {MAX_CID}")
 
-    doclens = flatten(load_doclens(args.index, flatten=False))
-    dl = torch.tensor(doclens, dtype=torch.long)
-    pids_all = torch.repeat_interleave(torch.arange(len(dl), dtype=torch.int32), dl).numpy()
-    offs = torch.cumsum(dl, 0)
-    starts = torch.cat([torch.zeros(1, dtype=torch.long), offs[:-1]])
-    pos_all = (torch.arange(len(pids_all), dtype=torch.long) - torch.repeat_interleave(starts, dl)).numpy().astype(np.int16)
+    doclens = np.asarray(flatten(load_doclens(args.index, flatten=False)), dtype=np.int64)
+    num_passages = len(doclens)
+    if num_passages - 1 > L.MAX_PID:
+        sys.exit(f"FATAL: {num_passages:,} passages exceed the 24-bit pid format.")
+    if doclens.sum() != total_tokens:
+        sys.exit(f"FATAL: doclens sum {doclens.sum():,} != token count {total_tokens:,}. "
+                 f"Refusing to pad or truncate pids.")
+    pids_all = np.repeat(np.arange(num_passages, dtype=np.int32), doclens)
+    print(f"Corpus: {num_passages:,} passages, {total_tokens:,} tokens, {num_centroids:,} centroids")
 
-    if len(pids_all) != total_tokens:
-        pids_all = pids_all[:total_tokens] if len(pids_all) > total_tokens else np.pad(pids_all, (0, total_tokens - len(pids_all)))
-        pos_all  = pos_all[:total_tokens]  if len(pos_all)  > total_tokens else np.pad(pos_all,  (0, total_tokens - len(pos_all)))
+    tmp_eids = os.path.join(args.outdir, "all_eids_tmp.mmap")
+    tmp_mask = os.path.join(args.outdir, "active_mask_tmp.mmap")
+    all_eids = np.memmap(tmp_eids, dtype=np.uint8, mode="w+", shape=(L.NUM_SUBSPACES, total_tokens))
+    active = np.memmap(tmp_mask, dtype=bool, mode="w+", shape=(L.NUM_SUBSPACES, total_tokens))
 
-    cb_path = os.path.join(args.outdir, "codebooks.npy")
-    if not os.path.exists(cb_path):
-        src_cb = "/local/scratch/a/cashman3/juno_pq_science_sparse8/codebooks.npy"
-        if not os.path.exists(src_cb):
-            src_cb = "/local/scratch/a/cashman3/juno_pq_lotte_full_sparse8/codebooks.npy"
-        shutil.copyfile(src_cb, cb_path)
-        print(f"Copied codebooks from {src_cb}")
-
-    codebooks = np.load(cb_path)
-    trees = [cKDTree(codebooks[s]) for s in range(NUM_SUBSPACES)]
-
-    # Use disk-backed memory-mapping to keep RAM usage under 15 GB!
-    mmap_eids_path = os.path.join(args.outdir, "all_eids_tmp.mmap")
-    mmap_mask_path = os.path.join(args.outdir, "active_mask_tmp.mmap")
-    all_eids = np.memmap(mmap_eids_path, dtype=np.int16, mode='w+', shape=(NUM_SUBSPACES, total_tokens))
-    active_mask = np.memmap(mmap_mask_path, dtype=bool, mode='w+', shape=(NUM_SUBSPACES, total_tokens))
-
-    print(f"Quantizing tokens with Semantic-Energy Top-{args.top_m} Subspace Allocation (Disk-backed memmap)...")
-    R_cuda = R.cuda()
+    print(f"Quantizing residual slices (top_m={args.top_m})...")
+    R_cuda = torch.from_numpy(R).cuda()
     for start in range(0, total_tokens, CHUNK):
         end = min(start + CHUNK, total_tokens)
-        obj = ResidualEmbeddings(torch.tensor(codes[start:end]), torch.tensor(residuals_packed[start:end]))
-        
+        obj = ResidualEmbeddings(torch.from_numpy(codes[start:end]), torch.from_numpy(residuals_packed[start:end]))
         emb_128 = searcher.ranker.codec.decompress(obj).cuda().float()
         emb_96 = torch.nn.functional.normalize(emb_128 @ R_cuda, p=2, dim=-1).cpu().numpy()
-        
-        emb_reshaped = emb_96.reshape(-1, NUM_SUBSPACES, 3)
-        emb_sq_norms = np.sum(emb_reshaped**2, axis=-1)
-
-        top_m_idx = np.argpartition(-emb_sq_norms, args.top_m, axis=-1)[:, :args.top_m]
-        resid = emb_96 - centroids_96[codes[start:end]]
-
-        for s in range(NUM_SUBSPACES):
-            mask_s = np.any(top_m_idx == s, axis=-1)
-            active_mask[s, start:end] = mask_s
-            if np.any(mask_s):
-                sub_vecs = resid[mask_s, 3*s : 3*s + 3]
-                _, eids = trees[s].query(sub_vecs)
-                all_eids[s, start:end][mask_s] = eids.astype(np.int16)
-
+        mask = L.top_m_active_mask(emb_96, args.top_m)
+        resid = L.residual_96(emb_96, centroids_96, codes[start:end])
+        for s in range(L.NUM_SUBSPACES):
+            m = mask[:, s]
+            active[s, start:end] = m
+            if m.any():
+                ids, _ = L.assign_nearest(L.subspace_slice(resid[m], s), codebooks[s])
+                row = np.zeros(end - start, dtype=np.uint8)
+                row[m] = ids
+                all_eids[s, start:end] = row
         if (start // CHUNK) % 10 == 0 or end == total_tokens:
-            print(f"  Processed {end:,} / {total_tokens:,} tokens ({end / total_tokens * 100:.1f}%)")
+            print(f"  {end:,} / {total_tokens:,} tokens")
+    all_eids.flush(); active.flush()
 
-    # Flush memory-mapped files to disk
-    all_eids.flush()
-    active_mask.flush()
+    del residuals_packed, searcher
+    gc.collect(); torch.cuda.empty_cache()
 
-    # CRITICAL: Delete residual memory and searcher to free 25+ GB before sorting!
-    print("Freeing quantization memory...")
-    del residuals_packed, searcher, trees
-    gc.collect()
-    torch.cuda.empty_cache()
+    total_postings = int(sum(int(np.count_nonzero(active[s])) for s in range(L.NUM_SUBSPACES)))
+    print(f"Compiling CSR: {total_postings:,} postings")
+    packed_path = os.path.join(args.outdir, "csr_packed_24.npy")
+    packed_out = np.lib.format.open_memmap(packed_path, mode="w+", dtype=np.uint8,
+                                           shape=(3 * total_postings,))
 
-    print("\nCompiling Unified Full-Corpus CSR Tables...")
-    all_row_ptrs, all_col_eids, all_offsets, all_lengths, all_packed = [], [], [], [], []
-    curr_global_col, curr_global_packed = 0, 0
+    row_ptrs_all, col_eids_all, lengths_all, offsets_all = [], [], [], []
+    col_base, packed_base = 0, 0
+    for s in range(L.NUM_SUBSPACES):
+        m = np.asarray(active[s])
+        csr = L.build_subspace_csr(codes[m], np.asarray(all_eids[s])[m], pids_all[m],
+                                   num_centroids, col_base, packed_base)
+        n_s = len(csr["pids_sorted"])
+        packed = L.pack_pids_24(csr["pids_sorted"])
+        # Round trip check on every subspace: decoding must give back the exact pids.
+        assert np.array_equal(L.unpack_pids_24(packed), csr["pids_sorted"]), f"pid round trip failed in subspace {s}"
+        packed_out[3 * packed_base: 3 * (packed_base + n_s)] = packed
 
-    for s in range(NUM_SUBSPACES):
-        mask_s = active_mask[s]
-        cids_s = codes[mask_s]
-        eids_s = all_eids[s, mask_s]
-        pids_s = pids_all[mask_s]
-        pos_s  = pos_all[mask_s]
-        num_s_tokens = len(cids_s)
+        row_ptrs_all.append(csr["row_ptrs"]); col_eids_all.append(csr["col_eids"])
+        lengths_all.append(csr["lengths"]);   offsets_all.append(csr["offsets"])
+        col_base += len(csr["col_eids"]); packed_base += n_s
+        del csr, packed, m; gc.collect()
+    packed_out.flush(); del packed_out
+    assert packed_base == total_postings
 
-        sort_keys = (cids_s.astype(np.int64) << 40) | (eids_s.astype(np.int64) << 24) | pids_s.astype(np.int64)
-        order = np.argsort(sort_keys, kind="stable")
+    row_ptrs = np.stack(row_ptrs_all)
+    if row_ptrs.max() > np.iinfo(np.int32).max:
+        sys.exit(f"FATAL: {row_ptrs.max():,} lists overflow int32 row pointers.")
+    lengths = np.concatenate(lengths_all)
+    offsets = np.concatenate(offsets_all)
+    bsums = L.block_sums(lengths)
 
-        cids_sorted = cids_s[order]
-        eids_sorted = eids_s[order]
-        pids_sorted = pids_s[order]
-        pos_sorted  = pos_s[order]
+    # Kernel offset reconstruction must reproduce the true offsets.
+    rng = np.random.default_rng(0)
+    probe = np.unique(np.concatenate([[0, len(lengths) - 1], rng.integers(0, len(lengths), 200_000)]))
+    assert np.array_equal(L.offsets_from_block_sums(bsums, lengths, probe), offsets[probe]), \
+        "block-sum offset reconstruction mismatch"
 
-        change = np.concatenate(([True], (cids_sorted[1:] != cids_sorted[:-1]) | (eids_sorted[1:] != eids_sorted[:-1])))
-        boundaries = np.nonzero(change)[0]
+    np.save(os.path.join(args.outdir, "csr_row_ptrs.npy"), row_ptrs.astype(np.int32))
+    np.save(os.path.join(args.outdir, "csr_col_eids.npy"), np.concatenate(col_eids_all).astype(np.uint8))
+    np.save(os.path.join(args.outdir, "csr_lengths.npy"), lengths.astype(np.uint16))
+    np.save(os.path.join(args.outdir, "csr_block_sums_128.npy"), bsums)
 
-        unique_cids = cids_sorted[boundaries]
-        unique_eids = eids_sorted[boundaries]
-        starts_b = boundaries
-        ends_b = np.append(boundaries[1:], num_s_tokens)
-        lengths_b = ends_b - starts_b
+    del all_eids, active
+    os.remove(tmp_eids); os.remove(tmp_mask)
+    print(f"[DONE] {len(lengths):,} lists, {total_postings:,} postings "
+          f"({3 * total_postings / 1e9:.2f} GB packed) in {args.outdir}")
 
-        row_ptrs = np.zeros(MAX_CID + 1, dtype=np.int32)
-        counts = np.bincount(unique_cids, minlength=MAX_CID)
-        row_ptrs[0] = curr_global_col
-        row_ptrs[1:] = curr_global_col + np.cumsum(counts)
-
-        col_eids = unique_eids.astype(np.uint8)
-        active_lengths = lengths_b.astype(np.uint16)
-        active_offsets = (starts_b + curr_global_packed).astype(np.int64)
-
-        max_pos = int(pos_sorted.max()) if len(pos_sorted) else 0
-        assert max_pos < 512, f"token position {max_pos} exceeds 9 bits"
-        packed_s = (pids_sorted.astype(np.int32) << 9) | pos_sorted.astype(np.int32)
-
-        all_row_ptrs.append(row_ptrs)
-        all_col_eids.append(col_eids)
-        all_offsets.append(active_offsets)
-        all_lengths.append(active_lengths)
-        all_packed.append(packed_s)
-
-        curr_global_col += len(col_eids)
-        curr_global_packed += len(packed_s)
-
-        # Free per-subspace temporary arrays
-        del mask_s, cids_s, eids_s, pids_s, pos_s, sort_keys, order
-        del cids_sorted, eids_sorted, pids_sorted, pos_sorted
-        gc.collect()
-
-    flat_row_ptrs = np.stack(all_row_ptrs)
-    flat_col_eids = np.concatenate(all_col_eids)
-    flat_offsets  = np.concatenate(all_offsets)
-    flat_lengths  = np.concatenate(all_lengths)
-    flat_packed   = np.concatenate(all_packed)
-
-    np.save(os.path.join(args.outdir, "csr_row_ptrs.npy"), flat_row_ptrs)
-    np.save(os.path.join(args.outdir, "csr_col_eids.npy"), flat_col_eids)
-    np.save(os.path.join(args.outdir, "csr_offsets.npy"), flat_offsets)
-    np.save(os.path.join(args.outdir, "csr_lengths.npy"), flat_lengths)
-    np.save(os.path.join(args.outdir, "csr_packed.npy"), flat_packed)
-
-    # Clean up temporary memory-mapped files to reclaim disk space
-    del all_eids, active_mask
-    if os.path.exists(mmap_eids_path): os.remove(mmap_eids_path)
-    if os.path.exists(mmap_mask_path): os.remove(mmap_mask_path)
-
-    meta_mb = (flat_row_ptrs.nbytes + flat_col_eids.nbytes + flat_offsets.nbytes + flat_lengths.nbytes) / 1e6
-    packed_mb = flat_packed.nbytes / 1e6
-    print(f"\n[DONE] CSR Index Compiled Successfully:")
-    print(f"  Metadata Footprint : {meta_mb:.2f} MB")
-    print(f"  Packed Postings    : {packed_mb:.2f} MB")
-    print(f"  Total Size         : {(meta_mb + packed_mb)/1024:.2f} GB")
 
 if __name__ == "__main__":
     main()

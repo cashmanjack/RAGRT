@@ -251,26 +251,6 @@ __global__ void sum_passages_fp16_to_fp32_kernel(
     passage_scores[pid] = total;
 }
 
-__global__ void rt_maxsim_rescore_from_approx_kernel(
-    const half* __restrict__ approx,
-    const int*  __restrict__ pids,
-    int num_cands, int ntok, int num_passages,
-    float* __restrict__ out_scores
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= num_cands) return;
-    int pid = pids[i];
-    float total = 0.0f;
-    if (pid >= 0 && pid < num_passages) {
-        #pragma unroll 8
-        for (int q = 0; q < ntok; ++q) {
-            float val = __half2float(approx[q * num_passages + pid]);
-            if (val > 0.0f) total += val;
-        }
-    }
-    out_scores[i] = total;
-}
-
 static bool g_buffers_allocated = false;
 static int *g_d_num_tasks[2]={nullptr, nullptr}, *g_d_task_queue_counter[2]={nullptr, nullptr}, *g_d_task_qt[2]={nullptr, nullptr}, *g_d_task_length[2]={nullptr, nullptr};
 static int *g_d_num_dropped_tasks[2]={nullptr, nullptr};
@@ -397,28 +377,9 @@ extern "C" void launch_ragrt_stage3_only(
     );
 }
 
-extern "C" half* ragrt_approx_score_buffer(int buf_idx) {
-    if (!g_buffers_allocated || buf_idx < 0 || buf_idx > 1) return nullptr;
-    return g_d_qt_pid_max_fp16[buf_idx];
-}
-
 extern "C" int ragrt_dropped_task_count(int buf_idx) {
     int h = 0;
     if (!g_buffers_allocated || buf_idx < 0 || buf_idx > 1) return 0;
     cudaMemcpy(&h, g_d_num_dropped_tasks[buf_idx], sizeof(int), cudaMemcpyDeviceToHost);
     return h;
-}
-
-extern "C" void launch_rt_maxsim_rescore_from_approx(
-    const half* d_approx, const int* d_pids,
-    int num_cands, int ntok, int num_passages,
-    float* d_out_scores, cudaStream_t stream
-) {
-    if (num_cands <= 0) return;
-    int active_ntok = (ntok <= 32) ? ntok : 32;
-    int threads = 256;
-    int blocks = (num_cands + threads - 1) / threads;
-    rt_maxsim_rescore_from_approx_kernel<<<blocks, threads, 0, stream>>>(
-        d_approx, d_pids, num_cands, active_ntok, num_passages, d_out_scores
-    );
 }

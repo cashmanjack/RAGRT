@@ -28,6 +28,7 @@ from fast_tilemaxsim_scorer import FastTileMaxSimScorer
 from colbert.search.strided_tensor import StridedTensor
 from colbert.modeling.colbert import colbert_score_reduce
 import rtrag_corr_3d
+import ragrt_index_lib as L
 
 # Load dataset paths
 if DATASET == 'msmarco':
@@ -127,7 +128,7 @@ def main():
     centroids_96   = torch.from_numpy(np.load(os.path.join(SPARSE_CSR_DIR, "centroids_96d_svd.npy"))).cuda().float()
     R_proj         = torch.from_numpy(np.load(os.path.join(SPARSE_CSR_DIR, "svd_rotation_128_to_96.npy"))).cuda().float()
 
-    native_pred_path = os.path.join(SPARSE_CSR_DIR, "doc_predicates.npy")
+    native_pred_path = os.path.join(SPARSE_CSR_DIR, "synthetic_predicates.npy" if DATASET == "msmarco" else "doc_predicates.npy")
     doc_predicates = torch.from_numpy(np.load(native_pred_path).astype(np.int64)).cuda()
 
     unified_idx.bind_index(
@@ -143,7 +144,7 @@ def main():
     Q_list = []
     for qid, q in questions[:NUM_QUERIES]:
         Qf = searcher.encode(q).squeeze(0).cuda()
-        ntok = min(len(q.split()) + 4, 32)
+        ntok = L.query_ntok(q)
         Q_act = Qf[:ntok, :].contiguous()
         Q_96 = torch.nn.functional.normalize(Q_act @ R_proj, p=2, dim=-1)
         Q_sub = Q_96.view(ntok, 32, 3).contiguous()
@@ -170,7 +171,7 @@ def main():
             p = selected_params['ragrt']
             _ = unified_idx.search_single_query_native(
                 Q_list[0][1], Q_list[0][2], Q_list[0][3], Q_list[0][4], Q_list[0][5],
-                p['nc'], p['ndocs'], TOP_K, 0, 0, p['eids'])
+                p['nc'], p['ndocs'], TOP_K, query_mask=0, k_eids=p['eids'])
     torch.cuda.synchronize()
 
     torch.cuda.profiler.start()
@@ -185,7 +186,7 @@ def main():
             p = selected_params['ragrt']
             _ = unified_idx.search_single_query_native(
                 Qf128, Qfp16, Qsub, topc, scores,
-                p['nc'], p['ndocs'], TOP_K, 0, 0, p['eids'])
+                p['nc'], p['ndocs'], TOP_K, query_mask=0, k_eids=p['eids'])
 
     torch.cuda.synchronize()
     torch.cuda.profiler.stop()
