@@ -248,11 +248,26 @@ def offsets_from_block_sums(bsums, lengths, list_ids, block=BLOCK_SIZE):
 # ---------------------------------------------------------------------------
 # Query rows used for candidate generation (single definition for all callers)
 # ---------------------------------------------------------------------------
-def query_ntok(query_text):
+QUERY_ROWS_DEFAULT = "mask"
+
+
+def query_ntok(searcher, query_text, mode=QUERY_ROWS_DEFAULT):
     """
-    Number of leading ColBERT query rows used for candidate generation.
-    KNOWN ISSUE (kept for now so numbers stay comparable): words + 4 undercounts
-    wordpieces, so long words get cut (e.g. 'hydrophilic?'). Replace with the
-    tokenizer attention-mask length, or all 32 rows as PLAID does, and re-run.
+    Number of leading ColBERT query rows used for candidate generation
+    (Stage 4 always reranks with all 32 rows).
+
+      "mask"   : real wordpiece tokens incl. [CLS], [Q], [SEP] (tokenizer attention mask).
+      "all"    : all 32 rows, including the [MASK] augmentation rows (what PLAID probes).
+      "legacy" : min(words + 4, 32). Undercounts wordpieces, e.g. 10 vs 13 real tokens
+                 for "is sudan iv hydrophobic or hydrophilic?". Kept only to reproduce
+                 numbers from before Oct 2026.
+    `searcher` only needs .checkpoint.query_tokenizer.tensorize([text]) -> (ids, mask).
     """
-    return min(len(query_text.split()) + 4, 32)
+    if mode == "all":
+        return 32
+    if mode == "legacy":
+        return min(len(query_text.split()) + 4, 32)
+    if mode != "mask":
+        raise ValueError(f"unknown query_ntok mode {mode!r}")
+    _, mask = searcher.checkpoint.query_tokenizer.tensorize([query_text])
+    return int(min(int(mask[0].sum()), 32))

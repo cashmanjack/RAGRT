@@ -61,7 +61,7 @@ class RAGRTPlugin:
     def encode_query(self, query_text, n_coarse=DEFAULT_N_COARSE):
         """128D query rows plus the 32x3D rays and coarse centroid probes."""
         Q_full = self.searcher.encode(query_text).squeeze(0).cuda()
-        ntok = L.query_ntok(query_text)
+        ntok = L.query_ntok(self.searcher, query_text)
         Q_act = Q_full[:ntok, :].contiguous()
         Q_96 = torch.nn.functional.normalize(Q_act @ self.R_proj, p=2, dim=-1)
         Q_sub = Q_96.view(ntok, L.NUM_SUBSPACES, L.SUBSPACE_DIM).contiguous()

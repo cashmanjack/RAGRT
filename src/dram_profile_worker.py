@@ -144,7 +144,7 @@ def main():
     Q_list = []
     for qid, q in questions[:NUM_QUERIES]:
         Qf = searcher.encode(q).squeeze(0).cuda()
-        ntok = L.query_ntok(q)
+        ntok = L.query_ntok(searcher, q)
         Q_act = Qf[:ntok, :].contiguous()
         Q_96 = torch.nn.functional.normalize(Q_act @ R_proj, p=2, dim=-1)
         Q_sub = Q_96.view(ntok, 32, 3).contiguous()

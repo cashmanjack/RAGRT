@@ -133,6 +133,20 @@ def test_colbert_padding_rows_are_dropped_but_other_mismatches_fail():
         raise AssertionError(f"stored={stored} should have failed")
 
 
+def test_query_ntok_modes():
+    class Tok:
+        def tensorize(self, texts):
+            mask = np.zeros((1, 32), dtype=np.int64); mask[0, :13] = 1
+            return None, mask
+    class S:
+        class checkpoint:
+            query_tokenizer = Tok()
+    q = "is sudan iv hydrophobic or hydrophilic?"
+    assert L.query_ntok(S, q) == 13            # attention mask
+    assert L.query_ntok(S, q, "legacy") == 10  # old heuristic dropped 3 wordpieces
+    assert L.query_ntok(S, q, "all") == 32
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

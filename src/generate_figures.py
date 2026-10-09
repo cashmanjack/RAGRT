@@ -225,7 +225,7 @@ def setup_engines():
     Q_batches, Q_full_128_list, Q_full_fp16_list, Q_sub3d_list, topc_list, scores_list, q_ntoks = [], [], [], [], [], [], []
     for qid, q in eval_qs:
         Qf = searcher.encode(q).squeeze(0).cuda()
-        ntok = L.query_ntok(q)
+        ntok = L.query_ntok(searcher, q)
         q_ntoks.append(ntok)
         Q_act = Qf[:ntok, :].contiguous()
         Q_96 = torch.nn.functional.normalize(Q_act @ R_proj, p=2, dim=-1)
