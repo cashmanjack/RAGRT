@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build the RAGRT index for unified LoTTE (2.43M passages): codebooks, CSR, predicates.
 set -euo pipefail
+export PYTHONUNBUFFERED=1   # progress shows up in nohup logs right away
 cd "$(dirname "$0")"
 
 INDEX="/home/min/a/cashman3/RTRAG/src/experiments/unified_lotte/indexes/unified.dev.2bit"

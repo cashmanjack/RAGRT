@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build the RAGRT index for MS MARCO: rotation + codebooks, CSR, synthetic predicates.
 set -euo pipefail
+export PYTHONUNBUFFERED=1   # progress shows up in nohup logs right away
 cd "$(dirname "$0")"
 
 INDEX_DIR="/local/scratch/a/cashman3/msmarco/indexes/msmarco/indexes/msmarco.dev.2bit"
