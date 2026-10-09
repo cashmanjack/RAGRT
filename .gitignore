@@ -3,7 +3,7 @@
 **/*.png
 **/*.csv
 # large data dirs (never commit)
-src/experiments/
+src/experiments
 src/data/
 # stale backups
 code_backup_v1/
