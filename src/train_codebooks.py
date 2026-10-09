@@ -27,6 +27,8 @@ sys.path.insert(0, os.path.join(BASE_DIR, "../reference/colbert-plaid"))
 
 from colbert import Searcher
 from colbert.indexing.codecs.residual_embeddings import ResidualEmbeddings
+from colbert.indexing.loaders import load_doclens
+from colbert.utils.utils import flatten
 
 import ragrt_index_lib as L
 
@@ -61,7 +63,11 @@ def main():
 
     codes = searcher.ranker.embeddings.codes.numpy()
     residuals_packed = searcher.ranker.embeddings.residuals.numpy()
-    total = codes.shape[0]
+    doclens_sum = int(np.sum(flatten(load_doclens(args.index, flatten=False))))
+    try:
+        total = L.num_real_tokens(codes.shape[0], doclens_sum)   # drop ColBERT's 512 pad rows
+    except ValueError as e:
+        sys.exit(f"FATAL: {e}")
     rng = np.random.default_rng(args.seed)
     n = min(args.sample_tokens, total)
     idx = np.sort(rng.choice(total, size=n, replace=False))

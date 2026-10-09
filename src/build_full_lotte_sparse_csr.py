@@ -72,17 +72,21 @@ def main():
     centroids_96 = L.l2_normalize(centroids_128 @ R)
     np.save(os.path.join(args.outdir, "centroids_96d_svd.npy"), centroids_96)
 
-    codes = searcher.ranker.embeddings.codes.numpy()
-    residuals_packed = searcher.ranker.embeddings.residuals.numpy()
-    total_tokens = codes.shape[0]
-
     doclens = np.asarray(flatten(load_doclens(args.index, flatten=False)), dtype=np.int64)
     num_passages = len(doclens)
     if num_passages - 1 > L.MAX_PID:
         sys.exit(f"FATAL: {num_passages:,} passages exceed the 24-bit pid format.")
-    if doclens.sum() != total_tokens:
-        sys.exit(f"FATAL: doclens sum {doclens.sum():,} != token count {total_tokens:,}. "
-                 f"Refusing to pad or truncate pids.")
+
+    codes = searcher.ranker.embeddings.codes.numpy()
+    residuals_packed = searcher.ranker.embeddings.residuals.numpy()
+    try:
+        total_tokens = L.num_real_tokens(codes.shape[0], doclens.sum())
+    except ValueError as e:
+        sys.exit(f"FATAL: {e}. Refusing to pad or truncate pids.")
+    if total_tokens != codes.shape[0]:
+        print(f"Dropping {codes.shape[0] - total_tokens} ColBERT padding rows")
+    codes = codes[:total_tokens]
+    residuals_packed = residuals_packed[:total_tokens]
     pids_all = np.repeat(np.arange(num_passages, dtype=np.int32), doclens)
     print(f"Corpus: {num_passages:,} passages, {total_tokens:,} tokens, {num_centroids:,} centroids")
 

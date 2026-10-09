@@ -79,6 +79,26 @@ def subspace_slice(x_96, s):
 
 
 # ---------------------------------------------------------------------------
+# ColBERT stores 512 padding rows after the last real token
+# ---------------------------------------------------------------------------
+COLBERT_PAD_ROWS = 512   # ResidualEmbeddings.load_chunks: num_embeddings += 512
+
+
+def num_real_tokens(stored_rows, doclens_sum):
+    """
+    ColBERT's ResidualEmbeddings.load_chunks allocates num_embeddings + 512 rows
+    ("pad for access with strides"), so codes/residuals have 512 trailing rows
+    that belong to no passage (uninitialized memory). Accept exactly that padding
+    and return the real token count; anything else is a real mismatch.
+    """
+    stored_rows, doclens_sum = int(stored_rows), int(doclens_sum)
+    if stored_rows in (doclens_sum, doclens_sum + COLBERT_PAD_ROWS):
+        return doclens_sum
+    raise ValueError(f"doclens sum {doclens_sum:,} != stored rows {stored_rows:,} "
+                     f"(difference {stored_rows - doclens_sum:,}, expected 0 or {COLBERT_PAD_ROWS})")
+
+
+# ---------------------------------------------------------------------------
 # k-means and quantization (numpy, chunked; 3D data so this is cheap)
 # ---------------------------------------------------------------------------
 def assign_nearest(x, centers, chunk=1 << 20):

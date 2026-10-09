@@ -122,6 +122,17 @@ def test_rotation_is_orthonormal_and_fingerprinted():
     assert L.rotation_fingerprint(R) != L.rotation_fingerprint(-R)
 
 
+def test_colbert_padding_rows_are_dropped_but_other_mismatches_fail():
+    assert L.num_real_tokens(266_206_025, 266_205_513) == 266_205_513   # real LoTTE numbers
+    assert L.num_real_tokens(1000, 1000) == 1000
+    for stored in (1001, 1511, 1513, 999):
+        try:
+            L.num_real_tokens(stored, 1000)
+        except ValueError:
+            continue
+        raise AssertionError(f"stored={stored} should have failed")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
