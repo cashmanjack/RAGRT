@@ -7,8 +7,8 @@ imports torch, CUDA or ColBERT, so it can be unit tested on any machine
 (see tests/test_index_lib.py).
 
 On-disk format produced by build_full_lotte_sparse_csr.py:
-  csr_row_ptrs.npy        int32  [S, num_centroids + 1]  global index into col arrays
-  csr_col_eids.npy        uint8  [num_lists]             fine codeword id per list
+  csr_row_ptrs.npy        int64  [S, num_centroids + 1]  global index into col arrays
+  csr_col_eids.npy        uint8 (E <= 256) or uint16 (E <= 65536) [num_lists]  fine codeword id
   csr_lengths.npy         uint16 [num_lists]             postings per list
   csr_block_sums_128.npy  int64  [ceil(num_lists/128)]   offset of list 128*b
   csr_packed_24.npy       uint8  [3 * num_postings]      little-endian 24-bit pids
@@ -23,7 +23,8 @@ PROJ_DIM = NUM_SUBSPACES * SUBSPACE_DIM  # 96
 PID_BITS = 24
 MAX_PID = (1 << PID_BITS) - 1            # 16,777,215
 MAX_LIST_LENGTH = np.iinfo(np.uint16).max
-MAX_EIDS_UINT8 = 256                     # kernel stores eids as uint8
+MAX_EIDS_UINT8 = 256                     # eids stored as uint8 up to here
+MAX_EIDS = 1 << 16                       # ... and as uint16 beyond (kernels template on the width)
 BLOCK_SIZE = 128                         # must match ragrt_fused_kernel.cu (>> 7)
 
 
@@ -101,8 +102,19 @@ def num_real_tokens(stored_rows, doclens_sum):
 # ---------------------------------------------------------------------------
 # k-means and quantization (numpy, chunked; 3D data so this is cheap)
 # ---------------------------------------------------------------------------
-def assign_nearest(x, centers, chunk=1 << 20):
-    """Returns (ids int32 [n], squared error float32 [n])."""
+def eid_dtype(num_entries):
+    """On-disk dtype of csr_col_eids for E codewords per subspace."""
+    if num_entries <= MAX_EIDS_UINT8:
+        return np.uint8
+    if num_entries <= MAX_EIDS:
+        return np.uint16
+    raise ValueError(f"E={num_entries} > {MAX_EIDS} does not fit 16-bit eids")
+
+
+def assign_nearest(x, centers, chunk=None):
+    """Returns (ids int32 [n], squared error float32 [n]). Memory per chunk ~ chunk * E floats."""
+    if chunk is None:
+        chunk = max(1024, (1 << 26) // max(1, len(centers)))
     x = np.asarray(x, dtype=np.float32)
     centers = np.asarray(centers, dtype=np.float32)
     c_sq = np.square(centers).sum(axis=1)

@@ -47,15 +47,23 @@ def worker(args):
         return
 
     from engines import Engines
-    ds = C.dataset(args.dataset)
+    ds = dataset_for(args)
     R = json.load(open(os.path.join(ds["results_dir"], "results.json")))
     sel = R["selection"][R["primary_target"]]
     perq = np.load(os.path.join(ds["results_dir"], "test_perquery.npz"))
     qids = [str(q) for q in perq["test_qids"][:args.n]]
     text = dict(E.load_questions(ds["questions_path"]))
-    eng = Engines(ds, load_ragrt=(args.range == "ragrt"))
+    o = R.get("meta", {}).get("ragrt") or {}
+    if o.get("sparse_csr_dir"):
+        ds["sparse_csr_dir"] = o["sparse_csr_dir"]
+        ds["predicates_path"] = os.path.join(o["sparse_csr_dir"], "predicates.npy")
+    eng = Engines(ds, load_ragrt=(args.range == "ragrt"), geometry=o.get("geometry", "polar"),
+                  stage3=o.get("stage3", "sparse"), rerank=o.get("rerank", "wmma"),
+                  rt_quantile=o.get("rt_quantile", 0.05))
     bank = [eng.encode(text[q]) for q in qids]
     p = sel[args.range]["params"]
+    if args.range == "ragrt":
+        eng.ensure_calibrated()                      # outside the profiled range
 
     def run():
         for Qf, n in bank:
@@ -69,9 +77,16 @@ def worker(args):
     torch.cuda.nvtx.range_pop()
 
 
+def dataset_for(args):
+    ds = C.dataset(args.dataset)
+    if args.results_subdir:
+        ds["results_dir"] = os.path.join(ds["results_dir"], args.results_subdir)
+    return ds
+
+
 def driver(args):
     ncu = args.ncu or shutil.which("ncu") or "/usr/local/cuda/bin/ncu"
-    ds = C.dataset(args.dataset)
+    ds = dataset_for(args)
     R = json.load(open(os.path.join(ds["results_dir"], "results.json")))
     sel = R["selection"][R["primary_target"]]
     out = {"n_queries": args.n, "operating_point": {e: sel[e]["key"] for e in ("plaid", "ptms", "ragrt") if sel.get(e)}}
@@ -84,7 +99,8 @@ def driver(args):
                    "--metrics", ",".join(METRICS), "--csv", "--page", "raw", "--print-units", "base",
                    "--cache-control", mode,
                    sys.executable, os.path.abspath(__file__), "--worker", "--range", rng,
-                   "--dataset", args.dataset, "--n", str(args.n)]
+                   "--dataset", args.dataset, "--n", str(args.n)] + \
+                  (["--results_subdir", args.results_subdir] if args.results_subdir else [])
             log = os.path.join(ds["results_dir"], f"ncu_{mode}_{rng}.log")
             print(f"  ncu [{mode}] {rng}  (log: {log})", flush=True)
             t0 = time.time()
@@ -123,6 +139,7 @@ if __name__ == "__main__":
     ap.add_argument("--dataset", required=True, choices=list(C.DATASETS))
     ap.add_argument("--n", type=int, default=10, help="TEST queries per engine (ncu serializes every kernel: keep small)")
     ap.add_argument("--ncu", default=None)
+    ap.add_argument("--results_subdir", default=None, help="profile the operating point of <results>/<dataset>/<subdir>")
     ap.add_argument("--worker", action="store_true")
     ap.add_argument("--range", choices=RANGES)
     a = ap.parse_args()

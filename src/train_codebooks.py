@@ -14,8 +14,12 @@ Quantization error is reported on a held-out split of the sampled tokens:
   mse      mean squared error of a slice vs its nearest codeword
   rel_err  mse / mean squared slice norm  (fraction of slice energy lost)
 
+k-means runs on the GPU (gpu_kmeans.py), so large E (1024 ... 16384) is practical.
+With large E use more samples (--sample_tokens) so each codeword sees enough slices.
+
 Usage:
-  python3 train_codebooks.py --index <colbert index> --collection <tsv> --outdir <dir>
+  python3 train_codebooks.py --index <colbert index> --collection <tsv> --outdir <dir> [--num_entries E]
+  --rotation_from <dir>: reuse that directory's svd_rotation_128_to_96.npy (E sweeps share one frame)
 """
 import os, sys, json, time, argparse
 import numpy as np
@@ -31,6 +35,7 @@ from colbert.indexing.loaders import load_doclens
 from colbert.utils.utils import flatten
 
 import ragrt_index_lib as L
+import gpu_kmeans as G
 
 
 def main():
@@ -44,7 +49,9 @@ def main():
     ap.add_argument("--holdout_frac", type=float, default=0.1)
     ap.add_argument("--iters", type=int, default=25)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--rotation_from", default=None, help="copy the rotation from this index dir")
     args = ap.parse_args()
+    L.eid_dtype(args.num_entries)   # validates E
     os.makedirs(args.outdir, exist_ok=True)
     t0 = time.time()
 
@@ -52,6 +59,9 @@ def main():
     centroids_128 = searcher.ranker.codec.centroids.detach().cpu().float().numpy()
 
     rot_path = os.path.join(args.outdir, "svd_rotation_128_to_96.npy")
+    if args.rotation_from and not os.path.exists(rot_path):
+        np.save(rot_path, np.load(os.path.join(args.rotation_from, "svd_rotation_128_to_96.npy")))
+        print(f"Copied rotation from {args.rotation_from}")
     if os.path.exists(rot_path):
         R = np.load(rot_path).astype(np.float32)
         print(f"Reusing rotation {rot_path}")
@@ -93,8 +103,8 @@ def main():
         perm = rng.permutation(len(x))
         n_hold = int(len(x) * args.holdout_frac)
         hold, train = x[perm[:n_hold]], x[perm[n_hold:]]
-        codebooks[s] = L.kmeans(train, E, iters=args.iters, seed=args.seed + s)
-        _, err = L.assign_nearest(hold, codebooks[s])
+        codebooks[s] = G.kmeans(train, E, iters=args.iters, seed=args.seed + s)
+        _, err = G.assign_np(hold, codebooks[s])
         energy = float(np.square(hold).sum(axis=1).mean())
         mse = float(err.mean())
         norms = np.linalg.norm(codebooks[s], axis=1)
@@ -102,7 +112,7 @@ def main():
                         "rel_err": mse / energy if energy > 0 else 0.0,
                         "codeword_norm_median": float(np.median(norms)),
                         "codeword_norm_max": float(norms.max())})
-        print(f"  s={s:2d}  slices={len(train):>10,}  mse={mse:.3e}  rel_err={per_sub[-1]['rel_err']:.3f}  "
+        print(f"  s={s:2d}  slices={len(train):>10,}  ({len(train) / E:.0f}/codeword)  mse={mse:.3e}  rel_err={per_sub[-1]['rel_err']:.3f}  "
               f"|c| median={per_sub[-1]['codeword_norm_median']:.3f}")
 
     np.save(os.path.join(args.outdir, "codebooks.npy"), codebooks)

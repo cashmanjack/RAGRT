@@ -19,6 +19,12 @@ Methodology, in order:
 Stages (each saved to results.json, so they can be rerun independently):
   sweep, select, test, breakdown, filtered, throughput, drops
 
+RAGRT options (see engines.py): --geometry polar|fan, --stage3 sparse|dense,
+--rerank wmma|simt (also used by ptms), --rt_quantile, --sparse_csr_dir (another
+index, e.g. a different codebook size E). --baseline_from <results dir> imports the
+plaid/ptms results of an earlier run on the same split instead of rerunning them
+(they do not depend on the RAGRT index), e.g. for the E sweep.
+
 Usage:
   python3 run_benchmarks.py --dataset lotte                      # everything
   python3 run_benchmarks.py --dataset msmarco --stages test,breakdown
@@ -42,8 +48,8 @@ PLAID_GRID = [{"ncells": n, "threshold": t, "ndocs": d}
               for n in [1, 2, 4, 8] for t in [0.3, 0.4, 0.45, 0.5, 0.6, 0.7]
               for d in [64, 128, 256, 512, 1024, 2048, 4096, 8192]]
 RAGRT_GRID = [{"nc": n, "eids": e, "ndocs": d}
-              for n in [4, 8, 16, 32, 64] for e in [4, 8, 16, 32, 64]
-              for d in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]]   # eids <= 64 (kernel s_top size)
+              for n in [4, 8, 16, 32, 64] for e in [4, 8, 16, 32, 64, 128]
+              for d in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]]   # eids <= 128 (kernel limit)
 QUICK_PLAID = [PLAID_DEFAULT_K100, {"ncells": 1, "threshold": 0.5, "ndocs": 256}]
 QUICK_RAGRT = [{"nc": 32, "eids": 16, "ndocs": 4096}, {"nc": 16, "eids": 32, "ndocs": 16384}]
 BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
@@ -55,6 +61,9 @@ class Bench:
         self.args = args
         self.engines = [e for e in ENGINES if e in args.engines]
         self.ds = C.dataset(args.dataset)
+        if args.sparse_csr_dir:
+            self.ds["sparse_csr_dir"] = args.sparse_csr_dir
+            self.ds["predicates_path"] = os.path.join(args.sparse_csr_dir, "predicates.npy")
         if args.results_subdir:
             self.ds["results_dir"] = os.path.join(self.ds["results_dir"], args.results_subdir)
         os.makedirs(self.ds["results_dir"], exist_ok=True)
@@ -84,7 +93,9 @@ class Bench:
         print(f"[{args.dataset}] {len(qids):,} queries with ground truth: tune {len(self.tune):,}, "
               f"test {len(self.test):,}", flush=True)
 
-        self.eng = Engines(self.ds)
+        self.eng = Engines(self.ds, load_ragrt=any(e in RAGRT_ENGINES for e in self.engines),
+                           geometry=args.geometry, stage3=args.stage3, rerank=args.rerank,
+                           rt_quantile=args.rt_quantile)
         self.bank = {}
         enc_ms = []
         need = self.tune + self.test
@@ -97,14 +108,46 @@ class Bench:
             enc_ms.append((time.perf_counter() - t0) * 1000)
         self.R["stage0a_encode"] = E.latency_summary(enc_ms)
         print(f"  encoded {len(need):,} queries, stage 0a median {np.median(enc_ms):.2f} ms", flush=True)
-        self.R["meta"] = {
+        if self.eng.index is not None:
+            self.eng.calibrate([self.bank[q] for q in self.tune[:args.calib_queries]])
+        if args.baseline_from:
+            self.import_baselines(args.baseline_from)
+        self.R["meta"] = {**self.R.get("meta", {}),
             "date": datetime.datetime.now().isoformat(timespec="seconds"),
             "gpu": torch.cuda.get_device_name(0),
             "git": subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=C.BASE_DIR,
                                   capture_output=True, text=True).stdout.strip(),
             "args": vars(args), "official_metric": self.ds["official_metric"],
             "query_rows": "attention mask (ragrt_index_lib.query_ntok)",
+            "ragrt": self.eng.options(),
         }
+
+    def import_baselines(self, src_dir):
+        """Copy plaid/ptms results (sweep, test, per-query, breakdown, filtered, throughput)."""
+        src = json.load(open(os.path.join(src_dir, "results.json")))
+        if src.get("split") != self.R["split"]:
+            sys.exit(f"FATAL: --baseline_from split {src.get('split')} != this run's {self.R['split']}")
+        perq = dict(np.load(os.path.join(src_dir, "test_perquery.npz")))
+        base = [e for e in ("plaid", "ptms") if e in src.get("sweep", {})]
+        for e in base:
+            self.R.setdefault("sweep", {})[e] = src["sweep"][e]
+            for k, v in src.get("test", {}).items():
+                if v.get("engine") == e:
+                    self.R.setdefault("test", {})[k] = v
+            for k, v in perq.items():
+                if k.startswith(e + "|"):
+                    self.perq[k] = v
+            if e in src.get("breakdown", {}):
+                self.R.setdefault("breakdown", {})[e] = src["breakdown"][e]
+            for f, d in src.get("filtered", {}).items():
+                if e in d:
+                    self.R.setdefault("filtered", {}).setdefault(f, {})[e] = d[e]
+            for k, v in src.get("throughput", {}).items():
+                if k.startswith(e + "_"):
+                    self.R.setdefault("throughput", {})[k] = v
+        self.R.setdefault("meta", {})["baselines_from"] = {"dir": src_dir, "engines": base,
+                                                           "meta": src.get("meta", {})}
+        print(f"  imported baselines {base} from {src_dir}", flush=True)
 
     # ------------------------------------------------------------------ core
     def mask_for(self, filt, q):
@@ -371,11 +414,15 @@ class Bench:
                 s["frac_rays_overflow"] = s["rays_overflow"] / rays
                 s["frac_combos_found"] = s["combos_found"] / max(s["combos"], 1)
                 s["frac_tasks_dropped"] = s["tasks_dropped"] / max(s["tasks"], 1)
+                s["hits_per_ray"] = s["hits"] / rays
+                s["frac_rays_short_of_k"] = s["rays_short"] / rays
+                s["postings_per_query"] = s["postings"] / max(len(qids), 1)
                 s["queries"] = len(qids)
                 s["engine"] = engine
                 out[f"{engine}|{key}"] = s
-                print(f"    {key:<28} overflow rays {s['frac_rays_overflow']:.2%}  tasks dropped "
-                      f"{s['frac_tasks_dropped']:.2%}  min-score drops {s['min_score_drops']:,}", flush=True)
+                print(f"    {engine:<8} {key:<28} hits/ray {s['hits_per_ray']:.1f}  short of k {s['frac_rays_short_of_k']:.1%}  "
+                      f"overflow {s['frac_rays_overflow']:.2%}  tasks dropped {s['frac_tasks_dropped']:.2%}  "
+                      f"postings/query {s['postings_per_query']:,.0f}", flush=True)
         finally:
             rtrag_corr_3d.set_drop_stats(False)
 
@@ -395,7 +442,16 @@ def main():
                     help="subset to run (results merge into an existing results.json), e.g. ragrt_bf")
     ap.add_argument("--gt_path", default=None, help="ground truth file (default: the full one for the dataset)")
     ap.add_argument("--results_subdir", default=None, help="write results to <results>/<dataset>/<subdir> (e.g. smoke)")
+    ap.add_argument("--sparse_csr_dir", default=None, help="RAGRT index dir (default: eval_config), e.g. an E-sweep index")
+    ap.add_argument("--geometry", default="polar", choices=["polar", "fan"])
+    ap.add_argument("--stage3", default="sparse", choices=["sparse", "dense"])
+    ap.add_argument("--rerank", default="wmma", choices=["wmma", "simt"])
+    ap.add_argument("--rt_quantile", type=float, default=0.05)
+    ap.add_argument("--calib_queries", type=int, default=300, help="TUNE queries used to calibrate polar thresholds")
+    ap.add_argument("--baseline_from", default=None, help="results dir whose plaid/ptms results to import")
     args = ap.parse_args()
+    if args.baseline_from:
+        args.engines = [e for e in args.engines if e in RAGRT_ENGINES]
 
     b = Bench(args)
     for st in args.stages.split(","):

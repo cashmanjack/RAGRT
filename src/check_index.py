@@ -3,7 +3,7 @@ Sanity-check a built RAGRT index directory (no GPU, no ColBERT needed).
 
   python3 check_index.py <sparse_csr_dir> [<sparse_csr_dir> ...]
 
-Checks: CSR shape invariants, block sums, codebook/rotation fingerprint,
+Checks: CSR shape invariants, block sums, codebook/rotation fingerprint, eid width vs E,
 pid range (max pid vs passage count, share of pids >= 2^22 that the old
 int32 packing used to corrupt). Reads csr_packed_24.npy in chunks via mmap.
 """
@@ -51,8 +51,15 @@ def check(d):
     expect(int(lengths.min()) >= 1, "no empty lists")
     expect(np.array_equal(bsums, L.block_sums(np.asarray(lengths))), "block sums match lengths")
 
-    expect(cb.shape[0] == L.NUM_SUBSPACES and cb.shape[2] == L.SUBSPACE_DIM and cb.shape[1] <= 256,
+    E = cb.shape[1]
+    expect(cb.shape[0] == L.NUM_SUBSPACES and cb.shape[2] == L.SUBSPACE_DIM and E <= L.MAX_EIDS,
            f"codebooks shape {tuple(cb.shape)}")
+    expect(eids.dtype == L.eid_dtype(E), f"csr_col_eids dtype {eids.dtype} matches E={E}")
+    mx = 0
+    for a in range(0, n_lists, CHUNK_POSTINGS):
+        mx = max(mx, int(np.asarray(eids[a:a + CHUNK_POSTINGS]).max()))
+    expect(mx < E, f"all eids < E (max {mx})")
+    expect(row_ptrs.dtype in (np.int32, np.int64), f"row_ptrs dtype {row_ptrs.dtype}")
     expect(meta.get("rotation_sha256") == L.rotation_fingerprint(R), "codebooks match this rotation")
     print(f"  codebook mean rel_err {meta.get('mean_rel_err', float('nan')):.3f}")
 

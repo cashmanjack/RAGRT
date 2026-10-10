@@ -23,6 +23,7 @@ from colbert.indexing.codecs.residual_embeddings import ResidualEmbeddings
 from colbert.utils.utils import flatten
 
 import ragrt_index_lib as L
+import gpu_kmeans as G
 
 CHUNK = 2_000_000
 
@@ -44,8 +45,7 @@ def load_matching_codebooks(outdir, R, top_m):
     codebooks = np.load(cb_path).astype(np.float32)
     S, E, D = codebooks.shape
     assert S == L.NUM_SUBSPACES and D == L.SUBSPACE_DIM, f"bad codebook shape {codebooks.shape}"
-    assert E <= L.MAX_EIDS_UINT8, (f"E={E} > 256: csr_col_eids is uint8 and the kernels "
-                                   f"assume 256 entries; widen them before building.")
+    L.eid_dtype(E)   # raises if E does not fit 16 bits
     return codebooks
 
 
@@ -90,12 +90,18 @@ def main():
     pids_all = np.repeat(np.arange(num_passages, dtype=np.int32), doclens)
     print(f"Corpus: {num_passages:,} passages, {total_tokens:,} tokens, {num_centroids:,} centroids")
 
-    tmp_eids = os.path.join(args.outdir, "all_eids_tmp.mmap")
-    tmp_mask = os.path.join(args.outdir, "active_mask_tmp.mmap")
-    all_eids = np.memmap(tmp_eids, dtype=np.uint8, mode="w+", shape=(L.NUM_SUBSPACES, total_tokens))
-    active = np.memmap(tmp_mask, dtype=bool, mode="w+", shape=(L.NUM_SUBSPACES, total_tokens))
+    E = codebooks.shape[1]
+    edt = L.eid_dtype(E)
+    print(f"E={E} codewords per subspace -> {np.dtype(edt).name} eids")
+    # Temp files: the active mask as bits [32, T/8] and, per subspace, the eids of its active
+    # tokens in token order (top_m of 32 subspaces are active, so ~top_m * 2 bytes per token).
+    tmp_mask = os.path.join(args.outdir, "active_bits_tmp.mmap")
+    tmp_eid_paths = [os.path.join(args.outdir, f"eids_s{s:02d}_tmp.bin") for s in range(L.NUM_SUBSPACES)]
+    active_bits = np.memmap(tmp_mask, dtype=np.uint8, mode="w+", shape=(L.NUM_SUBSPACES, (total_tokens + 7) // 8))
+    eid_files = [open(p, "wb") for p in tmp_eid_paths]
 
     print(f"Quantizing residual slices (top_m={args.top_m})...")
+    assert CHUNK % 8 == 0
     R_cuda = torch.from_numpy(R).cuda()
     for start in range(0, total_tokens, CHUNK):
         end = min(start + CHUNK, total_tokens)
@@ -106,64 +112,75 @@ def main():
         resid = L.residual_96(emb_96, centroids_96, codes[start:end])
         for s in range(L.NUM_SUBSPACES):
             m = mask[:, s]
-            active[s, start:end] = m
+            bits = np.packbits(m)
+            active_bits[s, start // 8: start // 8 + len(bits)] = bits
             if m.any():
-                ids, _ = L.assign_nearest(L.subspace_slice(resid[m], s), codebooks[s])
-                row = np.zeros(end - start, dtype=np.uint8)
-                row[m] = ids
-                all_eids[s, start:end] = row
+                ids, _ = G.assign_np(L.subspace_slice(resid[m], s), codebooks[s])
+                eid_files[s].write(ids.astype(edt).tobytes())
         if (start // CHUNK) % 10 == 0 or end == total_tokens:
             print(f"  {end:,} / {total_tokens:,} tokens")
-    all_eids.flush(); active.flush()
+    active_bits.flush()
+    for f in eid_files:
+        f.close()
 
     del residuals_packed, searcher
     gc.collect(); torch.cuda.empty_cache()
 
-    total_postings = int(sum(int(np.count_nonzero(active[s])) for s in range(L.NUM_SUBSPACES)))
+    def active_of(s):
+        return np.unpackbits(np.asarray(active_bits[s]), count=total_tokens).astype(bool)
+
+    total_postings = int(sum(os.path.getsize(p) // np.dtype(edt).itemsize for p in tmp_eid_paths))
     print(f"Compiling CSR: {total_postings:,} postings")
     packed_path = os.path.join(args.outdir, "csr_packed_24.npy")
     packed_out = np.lib.format.open_memmap(packed_path, mode="w+", dtype=np.uint8,
                                            shape=(3 * total_postings,))
 
-    row_ptrs_all, col_eids_all, lengths_all, offsets_all = [], [], [], []
+    row_ptrs_all, col_eids_all, lengths_all = [], [], []
+    probe_ids, probe_offs = [], []           # sample of (global list id, true offset) for validation
+    rng = np.random.default_rng(0)
     col_base, packed_base = 0, 0
     for s in range(L.NUM_SUBSPACES):
-        m = np.asarray(active[s])
-        csr = L.build_subspace_csr(codes[m], np.asarray(all_eids[s])[m], pids_all[m],
-                                   num_centroids, col_base, packed_base)
+        m = active_of(s)
+        eids_s = np.fromfile(tmp_eid_paths[s], dtype=edt)
+        assert len(eids_s) == int(m.sum()), f"subspace {s}: {len(eids_s)} eids for {int(m.sum())} active tokens"
+        csr = L.build_subspace_csr(codes[m], eids_s, pids_all[m], num_centroids, col_base, packed_base)
         n_s = len(csr["pids_sorted"])
         packed = L.pack_pids_24(csr["pids_sorted"])
         # Round trip check on every subspace: decoding must give back the exact pids.
         assert np.array_equal(L.unpack_pids_24(packed), csr["pids_sorted"]), f"pid round trip failed in subspace {s}"
         packed_out[3 * packed_base: 3 * (packed_base + n_s)] = packed
 
-        row_ptrs_all.append(csr["row_ptrs"]); col_eids_all.append(csr["col_eids"])
-        lengths_all.append(csr["lengths"]);   offsets_all.append(csr["offsets"])
-        col_base += len(csr["col_eids"]); packed_base += n_s
-        del csr, packed, m; gc.collect()
+        n_lists = len(csr["lengths"])
+        row_ptrs_all.append(csr["row_ptrs"])
+        col_eids_all.append(csr["col_eids"].astype(edt))
+        lengths_all.append(csr["lengths"].astype(np.uint16))   # build_subspace_csr checked the range
+        if n_lists:
+            pr = np.unique(np.concatenate([[0, n_lists - 1], rng.integers(0, n_lists, 8000)]))
+            probe_ids.append(col_base + pr); probe_offs.append(csr["offsets"][pr])
+        print(f"  subspace {s:2d}: {n_lists:,} lists, {n_s:,} postings", flush=True)
+        col_base += n_lists; packed_base += n_s
+        del csr, packed, m, eids_s; gc.collect()
     packed_out.flush(); del packed_out
     assert packed_base == total_postings
 
-    row_ptrs = np.stack(row_ptrs_all)
-    if row_ptrs.max() > np.iinfo(np.int32).max:
-        sys.exit(f"FATAL: {row_ptrs.max():,} lists overflow int32 row pointers.")
-    lengths = np.concatenate(lengths_all)
-    offsets = np.concatenate(offsets_all)
+    row_ptrs = np.stack(row_ptrs_all).astype(np.int64)
+    lengths = np.concatenate(lengths_all); del lengths_all
     bsums = L.block_sums(lengths)
 
     # Kernel offset reconstruction must reproduce the true offsets.
-    rng = np.random.default_rng(0)
-    probe = np.unique(np.concatenate([[0, len(lengths) - 1], rng.integers(0, len(lengths), 200_000)]))
-    assert np.array_equal(L.offsets_from_block_sums(bsums, lengths, probe), offsets[probe]), \
+    probe, want = np.concatenate(probe_ids), np.concatenate(probe_offs)
+    assert np.array_equal(L.offsets_from_block_sums(bsums, lengths, probe), want), \
         "block-sum offset reconstruction mismatch"
 
-    np.save(os.path.join(args.outdir, "csr_row_ptrs.npy"), row_ptrs.astype(np.int32))
-    np.save(os.path.join(args.outdir, "csr_col_eids.npy"), np.concatenate(col_eids_all).astype(np.uint8))
-    np.save(os.path.join(args.outdir, "csr_lengths.npy"), lengths.astype(np.uint16))
+    np.save(os.path.join(args.outdir, "csr_row_ptrs.npy"), row_ptrs)
+    np.save(os.path.join(args.outdir, "csr_col_eids.npy"), np.concatenate(col_eids_all))
+    np.save(os.path.join(args.outdir, "csr_lengths.npy"), lengths)
     np.save(os.path.join(args.outdir, "csr_block_sums_128.npy"), bsums)
 
-    del all_eids, active
-    os.remove(tmp_eids); os.remove(tmp_mask)
+    del active_bits
+    os.remove(tmp_mask)
+    for p in tmp_eid_paths:
+        os.remove(p)
     print(f"[DONE] {len(lengths):,} lists, {total_postings:,} postings "
           f"({3 * total_postings / 1e9:.2f} GB packed) in {args.outdir}")
 

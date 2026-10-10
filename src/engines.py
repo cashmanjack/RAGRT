@@ -4,8 +4,20 @@ The three retrieval engines behind one interface, for benchmarks and profiling.
   plaid  : stock ColBERTv2/PLAID (searcher.ranker.rank)
   ptms   : PLAID stages 1-3, then fused TileMaxSim rerank
   ragrt  : RT-core candidate generation + fused TileMaxSim rerank
-  ragrt_bf : identical pipeline, but Stage 1 is brute force on CUDA cores (exact top-k
-             codewords per token and subspace): the no-RT ablation
+  ragrt_bf : identical pipeline, but Stage 1 runs on CUDA cores: the no-RT ablation.
+             polar geometry: the same threshold query as a linear scan (identical hits);
+             fan geometry: exact top-k codewords per token and subspace.
+
+RAGRT options (Engines(..., geometry=, stage3=, rerank=, rt_quantile=)):
+  geometry  "polar" (default): exact-threshold scene, one triangle per codeword in the
+            plane x.c = 1; a ray hits exactly the codewords with d.c >= tau_s. tau_s is
+            calibrated per subspace and per k_eids level on sample query tokens
+            (calibrate()): the rt_quantile quantile of the k-th best d.c, so ~(1 - q) of
+            rays get at least k hits. "fan": the original scene (hits ~every codeword with
+            d.c > 0, any-hit computes the exact value; RT acts as a half-space filter).
+  stage3    "sparse" (default): sort only the touched postings. "dense": ntok x N table.
+  rerank    "wmma" (default): tensor-core TileMaxSim. "simt": the original kernel.
+            Applies to every engine that uses TileMaxSim (ptms too).
 
 Every search takes an already-encoded query (Qf: [32, 128] fp16 on the GPU) and
 returns a python list of pids, best first. Query encoding (BERT) is common to all
@@ -45,9 +57,18 @@ def cfg_key(engine, p):
     return ragrt_cfg_key(p) if engine in RAGRT_ENGINES else plaid_cfg_key(p)
 
 
+RT_LEVELS = (4, 8, 16, 32, 64, 128)     # k_eids values the polar scene is calibrated for
+
+
 class Engines:
-    def __init__(self, ds, load_ragrt=True):
+    def __init__(self, ds, load_ragrt=True, geometry="polar", stage3="sparse", rerank="wmma",
+                 rt_quantile=0.05, rt_levels=RT_LEVELS):
+        assert geometry in ("polar", "fan") and stage3 in ("sparse", "dense") and rerank in ("wmma", "simt")
         self.ds = ds
+        self.geometry, self.stage3, self.rerank, self.rt_quantile = geometry, stage3, rerank, rt_quantile
+        self.rt_levels = tuple(rt_levels)
+        self.calibration = None
+        rtrag_corr_3d.set_rerank_mode(rerank)
         self.searcher = Searcher(index=ds["index"], collection=ds["collection"])
         self.ranker = self.searcher.ranker
         self.N = len(self.ranker.doclens)
@@ -79,17 +100,87 @@ class Engines:
         ld = lambda n: np.load(os.path.join(d, n))
         self.R = torch.from_numpy(ld("svd_rotation_128_to_96.npy")).cuda().float()
         self.C96 = torch.from_numpy(ld("centroids_96d_svd.npy")).cuda().float()
+        self.CB = torch.tensor(ld("codebooks.npy"), dtype=torch.float32).contiguous()
+        self.E = self.CB.shape[1]
+        eids = ld("csr_col_eids.npy")
+        assert eids.dtype == L.eid_dtype(self.E), f"csr_col_eids is {eids.dtype} but E={self.E}"
+        if eids.dtype == np.uint16:
+            eids = eids.view(np.int16)          # same bytes; the kernel reads them as uint16
         self.index = rtrag_corr_3d.CorrIndex3D(C.PTX_PATH)
-        self.index.build(torch.tensor(ld("codebooks.npy"), dtype=torch.float32).contiguous(), 0.95, 4)
+        self.index.build(self.CB, 0.95, 4)
+        self.index.set_geometry(1 if self.geometry == "polar" else 0)
+        self.index.set_stage3_sparse(self.stage3 == "sparse")
+        self.CB = self.CB.cuda()
         self.index.bind_index(
-            torch.from_numpy(ld("csr_row_ptrs.npy").astype(np.int32)).cuda(),
-            torch.from_numpy(ld("csr_col_eids.npy")).cuda(),
+            torch.from_numpy(ld("csr_row_ptrs.npy").astype(np.int64)).cuda(),
+            torch.from_numpy(eids).cuda(),
             torch.from_numpy(ld("csr_block_sums_128.npy").astype(np.int64)).cuda(),
             torch.from_numpy(ld("csr_lengths.npy")).cuda(),
             torch.from_numpy(ld("csr_packed_24.npy")).cuda(),
             self.doc_offsets[:self.N + 1], self.doclens[:self.N], self.codes, self.residuals,
             self.centroids_fp16, self.bucket_weights, self.reversed_bit_map, self.decomp_table,
             torch.from_numpy(self.pred_np.astype(np.int64)).cuda().to(torch.uint32), self.N, self.C96.shape[0])
+
+    # ------------------------------------------------------------ calibration
+    @torch.no_grad()
+    def calibrate(self, Qs, quantile=None):
+        """
+        Per-subspace thresholds for the polar scene from sample queries [(Qf, ntok)]
+        (use TUNE queries). For level k: tau_s = the `quantile` quantile, over rays, of the
+        k-th largest unit-query . codeword in subspace s, clamped to [0.02, 0.999] x max|c_s|.
+        """
+        if self.index is None or self.geometry != "polar":
+            return None
+        q = self.rt_quantile if quantile is None else quantile
+        X = torch.cat([torch.nn.functional.normalize(Qf[:n].float() @ self.R, p=2, dim=-1).view(n, L.NUM_SUBSPACES, 3)
+                       for Qf, n in Qs])
+        X = torch.nn.functional.normalize(X, p=2, dim=-1)
+        ks = [min(k, self.E) for k in self.rt_levels]
+        taus = torch.zeros(len(ks), L.NUM_SUBSPACES)
+        hits = torch.zeros(len(ks), L.NUM_SUBSPACES)
+        short = torch.zeros(len(ks), L.NUM_SUBSPACES)
+        for s in range(L.NUM_SUBSPACES):
+            sc = X[:, s] @ self.CB[s].T                                   # [rays, E]
+            top = sc.topk(max(ks), dim=1).values
+            cmax = float(self.CB[s].norm(dim=1).max())
+            for l, k in enumerate(ks):
+                t = float(torch.quantile(top[:, k - 1], q))
+                t = min(max(t, 0.02 * cmax), 0.999 * cmax)
+                taus[l, s] = t
+                cnt = (sc >= t).sum(1).float()
+                hits[l, s] = cnt.mean()
+                short[l, s] = (cnt < k).float().mean()
+        self.index.set_polar_levels(taus, list(ks))
+        self.calibration = {
+            "quantile": q, "rays_per_subspace": int(X.shape[0]), "E": self.E,
+            "levels": [{"k": k, "tau_mean": float(taus[l].mean()), "hits_per_ray_mean": float(hits[l].mean()),
+                        "frac_rays_short": float(short[l].mean())} for l, k in enumerate(ks)],
+        }
+        for lv in self.calibration["levels"]:
+            print(f"  polar level k={lv['k']:<4} tau~{lv['tau_mean']:.4f}  hits/ray {lv['hits_per_ray_mean']:7.1f}  "
+                  f"rays short of k {lv['frac_rays_short']:.1%}  (E={self.E})", flush=True)
+        return self.calibration
+
+    def calibrate_from_questions(self, n=300):
+        """Calibrate on the first n queries of the TUNE split (by qid hash, C.TUNE_SIZE)."""
+        import eval_lib as EL
+        qs = EL.load_questions(self.ds["questions_path"])
+        tune, _ = EL.make_split([q for q, _ in qs], C.TUNE_SIZE, C.SPLIT_SEED)
+        text = dict(qs)
+        return self.calibrate([self.encode(text[q]) for q in tune[:n]])
+
+    def ensure_calibrated(self):
+        if self.index is not None and self.geometry == "polar" and self.calibration is None:
+            print("  calibrating polar thresholds on TUNE queries", flush=True)
+            self.calibrate_from_questions()
+
+    def options(self):
+        d = {"geometry": self.geometry, "stage3": self.stage3, "rerank": self.rerank,
+             "rt_quantile": self.rt_quantile, "calibration": self.calibration}
+        if self.index is not None:
+            d["index"] = {k: v for k, v in dict(self.index.info()).items() if k != "levels"}
+            d["sparse_csr_dir"] = self.ds["sparse_csr_dir"]
+        return d
 
     # ------------------------------------------------------------ stage 0a
     @torch.no_grad()
@@ -152,40 +243,53 @@ class Engines:
         topc = scores.topk(k=nc, dim=-1).indices.to(torch.int32).contiguous()
         return Q_sub, scores, topc
 
+    @torch.no_grad()
+    def ragrt_candidates(self, Qf, ntok, p, mask=0):
+        """Stages 0b-3 only: (candidate pids with -1 padding, approximate scores)."""
+        self.ensure_calibrated()
+        Q_sub, scores, topc = self.ragrt_prep(Qf, ntok, p["nc"])
+        return self.index.candidates(Q_sub, topc, scores, p["nc"], self.ndocs(p), mask, p["eids"])
+
     def stage1(self, brute_force):
-        """Select Stage 1: RT cores (False) or the brute-force CUDA-core ablation (True)."""
+        """Select Stage 1: RT cores (False) or the CUDA-core ablation (True)."""
         self.index.set_stage1_mode(1 if brute_force else 0)
+
+    def ndocs(self, p):
+        return min(p["ndocs"], self.N)
 
     @torch.no_grad()
     def ragrt(self, Qf, ntok, p, mask=0):
+        self.ensure_calibrated()
         Q_sub, scores, topc = self.ragrt_prep(Qf, ntok, p["nc"])
         out = self.index.search_single_query_native(
-            Qf.float(), Qf, Q_sub, topc, scores, p["nc"], p["ndocs"], C.TOP_K,
+            Qf.float(), Qf, Q_sub, topc, scores, p["nc"], self.ndocs(p), C.TOP_K,
             query_mask=mask, k_eids=p["eids"])
-        # If fewer than TOP_K candidates pass a very selective filter, topk would pad with
-        # failing pids (scored -inf); drop them.
-        return self.passes(out.tolist(), mask)
+        # Padding (-1, when fewer candidates exist than ndocs) and, under a very selective
+        # filter, failing pids (scored -inf) can reach the top-k; drop them.
+        return self.passes([x for x in out.tolist() if x >= 0], mask)
 
     @torch.no_grad()
     def ragrt_profiled(self, Qf, ntok, p):
         """(pids, [s0b, s1, s2, s3, s4] ms). s0b by CUDA events around the prep."""
+        self.ensure_calibrated()
         e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         e0.record()
         Q_sub, scores, topc = self.ragrt_prep(Qf, ntok, p["nc"])
         e1.record()
         out, st = self.index.search_single_query_profiled(
-            Qf.float(), Qf, Q_sub, topc, scores, p["nc"], p["ndocs"], C.TOP_K,
+            Qf.float(), Qf, Q_sub, topc, scores, p["nc"], self.ndocs(p), C.TOP_K,
             query_mask=0, k_eids=p["eids"])
         torch.cuda.synchronize()
-        return out.tolist(), [e0.elapsed_time(e1)] + list(st)
+        return [x for x in out.tolist() if x >= 0], [e0.elapsed_time(e1)] + list(st)
 
     @torch.no_grad()
     def ragrt_pipelined(self, Qfs, ntoks, p, mask=0):
         """Throughput path: prep every query, then the dual-stream pipelined search."""
+        self.ensure_calibrated()
         preps = [self.ragrt_prep(q, n, p["nc"]) for q, n in zip(Qfs, ntoks)]
         out = self.index.search_batch_pipelined(
             [q.float() for q in Qfs], list(Qfs), [x[0] for x in preps], [x[2] for x in preps],
-            [x[1] for x in preps], p["nc"], p["ndocs"], C.TOP_K, query_mask=mask, k_eids=p["eids"])
+            [x[1] for x in preps], p["nc"], self.ndocs(p), C.TOP_K, query_mask=mask, k_eids=p["eids"])
         return out
 
     def search(self, engine, Qf, ntok, p, mask=0):

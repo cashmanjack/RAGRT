@@ -22,7 +22,7 @@ STYLE = {
     "ragrt": {"color": "#2a78d6", "marker": "o", "label": "RAGRT"},
     "plaid": {"color": "#eb6834", "marker": "s", "label": "PLAID"},
     "ptms":  {"color": "#1baf7a", "marker": "D", "label": "PLAID+TMS"},
-    "ragrt_bf": {"color": "#eda100", "marker": "^", "label": "RAGRT, no RT (brute-force Stage 1)"},
+    "ragrt_bf": {"color": "#eda100", "marker": "^", "label": "RAGRT, no RT (CUDA-core Stage 1)"},
 }
 ALL_ENGINES = ["plaid", "ptms", "ragrt", "ragrt_bf"]
 ENGINES = ALL_ENGINES          # narrowed in main() to the engines present in results.json
@@ -203,11 +203,29 @@ def fig_throughput(R, out):
     save(fig, out, "fig_throughput.png")
 
 
+def ragrt_opts_line(R):
+    o = R["meta"].get("ragrt") or {}
+    if not o:
+        return "- RAGRT options: (not recorded; pre-Oct-2026 run: fan geometry, dense stage 3, simt rerank)"
+    idx = o.get("index", {})
+    line = (f"- RAGRT: E={idx.get('num_entries', '?')}, geometry {o.get('geometry')}, stage 3 {o.get('stage3')}, "
+            f"rerank {o.get('rerank')} (also PLAID+TMS), index {o.get('sparse_csr_dir', '?')}")
+    cal = o.get("calibration")
+    if cal:
+        line += "; polar thresholds at quantile {q}: ".format(q=cal["quantile"]) + ", ".join(
+            f"k={lv['k']}: {lv['hits_per_ray_mean']:.0f} hits/ray" for lv in cal["levels"])
+    b = R["meta"].get("baselines_from")
+    if b:
+        line += f"\n- PLAID / PLAID+TMS imported from {b['dir']} (rerank {((b.get('meta') or {}).get('ragrt') or {}).get('rerank', 'simt')})"
+    return line
+
+
 def summary_md(R, out, metric_name):
     L = [f"# RAGRT results: {R['meta']['args']['dataset']}", "",
          f"- {R['meta']['date']} on {R['meta']['gpu']}, git {R['meta']['git']}",
          f"- queries: {R['split']['tune']:,} tune / {R['split']['test']:,} test (seeded hash split)",
          f"- stage 0a query encoding (common to all engines): median {R['stage0a_encode']['median']:.2f} ms",
+         ragrt_opts_line(R),
          "", "## Operating points (TEST, 95% bootstrap CI)", "",
          f"| target | engine | config | median ms | p99 ms | exact R@10 | {metric_name} |",
          "|---|---|---|---|---|---|---|"]
@@ -233,12 +251,15 @@ def summary_md(R, out, metric_name):
                  f"{f('gt_r10_diff_vs_ptms')} | {f('official_diff_vs_ptms')} | {sp('speedup_vs_ragrt_bf')} | "
                  f"{f('gt_r10_diff_vs_ragrt_bf')} |")
     if "drops" in R:
-        L += ["", "## RAGRT silent drops (diagnostic pass, counters off during timing)", "",
-              "| config | rays > 128 hits | hits lost to cap | tasks dropped (MAX_TASKS) | MIN_BASE_SCORE drops |",
-              "|---|---|---|---|---|"]
+        L += ["", "## RAGRT stage counters (diagnostic pass, counters off during timing)", "",
+              "| config | stage-1 hits/ray | rays short of k | rays over hit cap | tasks dropped (MAX_TASKS) | "
+              "MIN_BASE_SCORE drops | postings/query |",
+              "|---|---|---|---|---|---|---|"]
         for k, s in R["drops"].items():
-            L.append(f"| {k} | {s['frac_rays_overflow']:.2%} | {s['hits_lost_to_cap']:,} | "
-                     f"{s['frac_tasks_dropped']:.2%} | {s['min_score_drops']:,} |")
+            g = lambda n, fmt: format(s[n], fmt) if n in s else "n/a"
+            L.append(f"| {k} | {g('hits_per_ray', '.1f')} | {g('frac_rays_short_of_k', '.1%')} | "
+                     f"{s['frac_rays_overflow']:.2%} | {s['frac_tasks_dropped']:.2%} | {s['min_score_drops']:,} | "
+                     f"{g('postings_per_query', ',.0f')} |")
     dpath = os.path.join(out, "dram.json")
     if os.path.exists(dpath):
         D = json.load(open(dpath))

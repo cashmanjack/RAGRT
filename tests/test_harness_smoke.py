@@ -19,7 +19,8 @@ torch.cuda.get_device_name = lambda *a, **k: "fake-gpu"
 # --- stub the compiled extension and the ColBERT-backed engines -------------
 ext = types.ModuleType("rtrag_corr_3d")
 _stats = {"on": False, "v": dict.fromkeys(["launches", "rays", "rays_overflow", "hits_lost_to_cap", "combos",
-                                            "combos_found", "min_score_drops", "tasks", "tasks_dropped"], 0)}
+                                            "combos_found", "min_score_drops", "tasks", "tasks_dropped",
+                                            "hits", "rays_short", "postings"], 0)}
 ext.set_drop_stats = lambda on: _stats.__setitem__("on", on)
 ext.reset_drop_stats = lambda: _stats["v"].update(dict.fromkeys(_stats["v"], 0))
 ext.get_drop_stats = lambda: dict(_stats["v"])
@@ -37,11 +38,22 @@ def cfg_key(engine, p):
 
 class FakeEngines:
     device = "cpu"
+    calls = []
 
-    def __init__(self, ds, load_ragrt=True):
+    def __init__(self, ds, load_ragrt=True, **opts):
+        FakeEngines.calls.append({"load_ragrt": load_ragrt, "sparse_csr_dir": ds["sparse_csr_dir"], **opts})
+        self.index = object() if load_ragrt else None
+        self.opts = opts
+        self.calibrated = 0
         self.N = N_DOCS
         self.pred_np = np.load(ds["predicates_path"]).astype(np.uint32)
         self.pred_gpu = torch.from_numpy(self.pred_np.astype(np.int64))
+
+    def calibrate(self, Qs):
+        self.calibrated = len(Qs)
+
+    def options(self):
+        return {**self.opts, "calibrated_on": self.calibrated}
 
     def encode(self, text):
         g = np.random.default_rng(abs(hash(text)) % (2 ** 32))
@@ -145,6 +157,23 @@ def main():
     assert set(R["filtered"]) == {"syn5", "syn14", "syn30", "syn60"}
     assert R["drops"] and all(s["rays"] > 0 for s in R["drops"].values())
     assert "ragrt_pipelined_qps" in R["throughput"]
+
+    # E-sweep style run: other index dir, RAGRT engines only, plaid/ptms imported
+    src = os.path.join(os.environ["RAGRT_RESULTS"], "msmarco")
+    sys.argv = ["run_benchmarks.py", "--dataset", "msmarco", "--quick", "--tune_size", "60",
+                "--results_subdir", "E1024", "--sparse_csr_dir", C.DATASETS["msmarco"]["sparse_csr_dir"],
+                "--baseline_from", src, "--geometry", "fan", "--stage3", "dense", "--rerank", "simt",
+                "--repeats", "1", "--max_filter_queries", "40", "--throughput_queries", "32", "--targets", "0.5,0.9"]
+    run_benchmarks.main()
+    last = FakeEngines.calls[-1]
+    assert last["geometry"] == "fan" and last["stage3"] == "dense" and last["rerank"] == "simt" and last["load_ragrt"]
+    R2 = json.load(open(os.path.join(src, "E1024", "results.json")))
+    assert set(R2["sweep"]) == {"plaid", "ptms", "ragrt", "ragrt_bf"}
+    assert R2["sweep"]["plaid"] == R["sweep"]["plaid"], "plaid sweep must be imported unchanged"
+    assert R2["meta"]["baselines_from"]["engines"] == ["plaid", "ptms"]
+    assert R2["meta"]["ragrt"]["calibrated_on"] == 60
+    assert "speedup_vs_ptms" in R2["comparisons"][R2["primary_target"]]
+    assert R2["breakdown"]["ptms"] == R["breakdown"]["ptms"]
 
     import plot_results
     sys.argv = ["plot_results.py", "--dataset", "msmarco"]
