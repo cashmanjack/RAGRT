@@ -52,10 +52,24 @@ extern "C" __global__ void __anyhit__corr_3d() {
     unsigned int cnt = optixGetPayload_1();
     optixSetPayload_1(cnt + 1);
 
+    int base = logical_ray_id * params.max_hits;
     if (cnt < params.max_hits) {
-        int base = logical_ray_id * params.max_hits + cnt;
-        params.out_hit_centroid[base] = entry_id;
-        params.out_hit_value[base]    = value;
+        params.out_hit_centroid[base + cnt] = entry_id;
+        params.out_hit_value[base + cnt]    = value;
+    } else {
+        // Buffer full: keep the best max_hits hits, not the first ones (any-hit order is
+        // arbitrary). Replace the current minimum if this hit beats it. Only overflowing
+        // rays pay this scan (about 1% of rays on LoTTE).
+        int   min_j = 0;
+        float min_v = params.out_hit_value[base];
+        for (int j = 1; j < params.max_hits; ++j) {
+            float v = params.out_hit_value[base + j];
+            if (v < min_v) { min_v = v; min_j = j; }
+        }
+        if (value > min_v) {
+            params.out_hit_centroid[base + min_j] = entry_id;
+            params.out_hit_value[base + min_j]    = value;
+        }
     }
 
     optixIgnoreIntersection();

@@ -22,8 +22,10 @@ STYLE = {
     "ragrt": {"color": "#2a78d6", "marker": "o", "label": "RAGRT"},
     "plaid": {"color": "#eb6834", "marker": "s", "label": "PLAID"},
     "ptms":  {"color": "#1baf7a", "marker": "D", "label": "PLAID+TMS"},
+    "ragrt_bf": {"color": "#eda100", "marker": "^", "label": "RAGRT, no RT (brute-force Stage 1)"},
 }
-ENGINES = ["plaid", "ptms", "ragrt"]
+ALL_ENGINES = ["plaid", "ptms", "ragrt", "ragrt_bf"]
+ENGINES = ALL_ENGINES          # narrowed in main() to the engines present in results.json
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 
 plt.rcParams.update({
@@ -46,6 +48,8 @@ def fig_pareto(R, out, metric_name):
     for ax, qkey, ylabel in [(axes[0], "gt_r10", "Recall of exact top-10 (TUNE)"),
                              (axes[1], "official", f"{metric_name} (TUNE)")]:
         for e in ENGINES:
+            if e not in sweep:
+                continue
             st = STYLE[e]
             pts = sweep[e]
             ax.scatter([p["lat_median"] for p in pts], [p[qkey] for p in pts], s=10,
@@ -69,7 +73,7 @@ def fig_pareto(R, out, metric_name):
 def fig_operating_point(R, out, metric_name):
     target = R["primary_target"]
     sel, test = R["selection"][target], R["test"]
-    engines = [e for e in ENGINES if sel.get(e)]
+    engines = [e for e in ENGINES if sel.get(e) and f"{e}|{sel[e]['key']}" in test]
     rows = [test[f"{e}|{sel[e]['key']}"] for e in engines]
     fig, axes = plt.subplots(1, 3, figsize=(11, 3.4), layout="constrained")
     x = np.arange(len(engines))
@@ -102,10 +106,11 @@ def fig_breakdown(R, out):
         bars.append(("PLAID", [("Stages 1-3", b["plaid"]["s1_3"]), ("Stage 4 (est.)", b["plaid"]["s4_est"])]))
     if "ptms" in b:
         bars.append(("PLAID+TMS", [("Stages 1-3", b["ptms"]["s1_3"]), ("Stage 4 TMS", b["ptms"]["s4"])]))
-    if "ragrt" in b:
-        r = b["ragrt"]
-        bars.append(("RAGRT", [("0b prep", r["s0b_prep"]), ("1 RT", r["s1_rt"]), ("2 gather", r["s2_gather"]),
-                               ("3 score", r["s3_score"]), ("4 TMS", r["s4_tms"])]))
+    for e, name, s1 in (("ragrt", "RAGRT", "1 RT"), ("ragrt_bf", "RAGRT no-RT", "1 brute")):
+        if e in b:
+            r = b[e]
+            bars.append((name, [("0b prep", r["s0b_prep"]), (s1, r["s1_rt"]), ("2 gather", r["s2_gather"]),
+                                ("3 score", r["s3_score"]), ("4 TMS", r["s4_tms"])]))
     shades = ["#cde2fb", "#9ec5f4", "#6ba6ea", "#2a78d6", "#1c5299"]
     longest = max(sum(v for _, v in segs) for _, segs in bars)
     for i, (name, segs) in enumerate(bars):
@@ -128,7 +133,7 @@ def fig_latency_cdf(R, perq, out):
     sel, test = R["selection"][R["primary_target"]], R["test"]
     fig, axes = plt.subplots(1, 2, figsize=(10, 3.6), layout="constrained")
     for e in ENGINES:
-        if not sel.get(e):
+        if not sel.get(e) or f"{e}|{sel[e]['key']}|lat" not in perq:
             continue
         k = f"{e}|{sel[e]['key']}"
         lat = np.sort(perq[f"{k}|lat"])
@@ -158,7 +163,9 @@ def fig_filtered(R, out):
             continue
         st = STYLE[e]
         xs = [p for p, _ in syn] + [100]
-        unf = test[f"{e}|{sel[e]['key']}"]
+        unf = test.get(f"{e}|{sel[e]['key']}") if sel.get(e) else None
+        if unf is None:
+            continue
         r10 = [F[k][e]["gt_r10"]["mean"] for _, k in syn] + [unf["gt_r10"]["mean"]]
         lat = [F[k][e]["lat"]["median"] for _, k in syn] + [unf["lat"]["median"]]
         starve = [F[k][e]["frac_under_10_results"] for _, k in syn] + [unf["frac_under_10_results"]]
@@ -183,10 +190,12 @@ def fig_throughput(R, out):
         if k in T:
             ax.axhline(T[k], color=STYLE[e]["color"], linewidth=1.5, linestyle="--")
             ax.text(1, T[k], f" {STYLE[e]['label']} sequential {T[k]:.0f} QPS", va="bottom", fontsize=8, color=INK2)
-    if "ragrt_pipelined_qps" in T:
-        B = sorted(int(b) for b in T["ragrt_pipelined_qps"])
-        ax.plot(B, [T["ragrt_pipelined_qps"][str(b)] for b in B], color=STYLE["ragrt"]["color"],
-                marker="o", markersize=5, label="RAGRT pipelined (dual stream)")
+    for e in ("ragrt", "ragrt_bf"):
+        k = f"{e}_pipelined_qps"
+        if k in T:
+            B = sorted(int(b) for b in T[k])
+            ax.plot(B, [T[k][str(b)] for b in B], color=STYLE[e]["color"], marker=STYLE[e]["marker"],
+                    markersize=5, label=f"{STYLE[e]['label']} pipelined")
     ax.set_xscale("log", base=2); ax.set_xlabel("Queries per pipelined call")
     ax.set_ylabel("Throughput (queries / s)")
     ax.legend(loc="lower right")
@@ -215,12 +224,14 @@ def summary_md(R, out, metric_name):
                      f"{t['lat']['p99']:.2f} | {ci('gt_r10')} | {ci('official')} |")
     L += ["", "## RAGRT vs baselines at each target", "",
           "| target | speedup vs PLAID | speedup vs PLAID+TMS | exact R@10 diff vs PLAID+TMS | "
-          f"{metric_name} diff vs PLAID+TMS |", "|---|---|---|---|---|"]
+          f"{metric_name} diff vs PLAID+TMS | RT vs no-RT speedup | exact R@10 diff vs no-RT |",
+          "|---|---|---|---|---|---|---|"]
     for name, c in R.get("comparisons", {}).items():
         f = lambda k: f"{c[k]['mean']:+.4f} [{c[k]['ci95'][0]:+.4f}, {c[k]['ci95'][1]:+.4f}]" if k in c else "n/a"
         sp = lambda k: f"{c[k]:.2f}x" if k in c else "n/a"
         L.append(f"| {name} | {sp('speedup_vs_plaid')} | {sp('speedup_vs_ptms')} | "
-                 f"{f('gt_r10_diff_vs_ptms')} | {f('official_diff_vs_ptms')} |")
+                 f"{f('gt_r10_diff_vs_ptms')} | {f('official_diff_vs_ptms')} | {sp('speedup_vs_ragrt_bf')} | "
+                 f"{f('gt_r10_diff_vs_ragrt_bf')} |")
     if "drops" in R:
         L += ["", "## RAGRT silent drops (diagnostic pass, counters off during timing)", "",
               "| config | rays > 128 hits | hits lost to cap | tasks dropped (MAX_TASKS) | MIN_BASE_SCORE drops |",
@@ -254,6 +265,9 @@ def main():
     perq_path = os.path.join(out, "test_perquery.npz")
     perq = dict(np.load(perq_path)) if os.path.exists(perq_path) else {}
     metric = ds["official_metric"].replace("mrr", "MRR").replace("success", "Success")
+    global ENGINES
+    present = set(R.get("sweep", {})) | {t.split("|")[0] for t in R.get("test", {})}
+    ENGINES = [e for e in ALL_ENGINES if e in present] or ALL_ENGINES
     if "sweep" in R:
         fig_pareto(R, out, metric)
     if "test" in R and "selection" in R:

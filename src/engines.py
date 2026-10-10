@@ -4,6 +4,8 @@ The three retrieval engines behind one interface, for benchmarks and profiling.
   plaid  : stock ColBERTv2/PLAID (searcher.ranker.rank)
   ptms   : PLAID stages 1-3, then fused TileMaxSim rerank
   ragrt  : RT-core candidate generation + fused TileMaxSim rerank
+  ragrt_bf : identical pipeline, but Stage 1 is brute force on CUDA cores (exact top-k
+             codewords per token and subspace): the no-RT ablation
 
 Every search takes an already-encoded query (Qf: [32, 128] fp16 on the GPU) and
 returns a python list of pids, best first. Query encoding (BERT) is common to all
@@ -36,8 +38,11 @@ def ragrt_cfg_key(p):
     return f"nc={p['nc']} eids={p['eids']} ndocs={p['ndocs']}"
 
 
+RAGRT_ENGINES = ("ragrt", "ragrt_bf")
+
+
 def cfg_key(engine, p):
-    return ragrt_cfg_key(p) if engine == "ragrt" else plaid_cfg_key(p)
+    return ragrt_cfg_key(p) if engine in RAGRT_ENGINES else plaid_cfg_key(p)
 
 
 class Engines:
@@ -147,6 +152,10 @@ class Engines:
         topc = scores.topk(k=nc, dim=-1).indices.to(torch.int32).contiguous()
         return Q_sub, scores, topc
 
+    def stage1(self, brute_force):
+        """Select Stage 1: RT cores (False) or the brute-force CUDA-core ablation (True)."""
+        self.index.set_stage1_mode(1 if brute_force else 0)
+
     @torch.no_grad()
     def ragrt(self, Qf, ntok, p, mask=0):
         Q_sub, scores, topc = self.ragrt_prep(Qf, ntok, p["nc"])
@@ -184,8 +193,12 @@ class Engines:
             return self.plaid(Qf, p, mask)
         if engine == "ptms":
             return self.ptms(Qf, p, mask)
-        if engine == "ragrt":
-            return self.ragrt(Qf, ntok, p, mask)
+        if engine in RAGRT_ENGINES:
+            self.stage1(engine == "ragrt_bf")
+            try:
+                return self.ragrt(Qf, ntok, p, mask)
+            finally:
+                self.stage1(False)
         raise ValueError(engine)
 
 

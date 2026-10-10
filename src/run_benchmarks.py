@@ -31,10 +31,11 @@ import torch
 
 import eval_config as C
 import eval_lib as E
-from engines import Engines, cfg_key
+from engines import Engines, cfg_key, RAGRT_ENGINES
 import rtrag_corr_3d
 
-ENGINES = ["plaid", "ptms", "ragrt"]
+CORE = ["plaid", "ptms", "ragrt"]          # the primary operating point must be reachable by these
+ENGINES = CORE + ["ragrt_bf"]              # ragrt_bf: no-RT ablation (brute-force Stage 1)
 PLAID_DEFAULT_K100 = {"ncells": 2, "threshold": 0.45, "ndocs": 1024}   # ColBERT Searcher defaults for k=100
 
 PLAID_GRID = [{"ncells": n, "threshold": t, "ndocs": d}
@@ -52,6 +53,7 @@ WARMUP = 5
 class Bench:
     def __init__(self, args):
         self.args = args
+        self.engines = [e for e in ENGINES if e in args.engines]
         self.ds = C.dataset(args.dataset)
         if args.results_subdir:
             self.ds["results_dir"] = os.path.join(self.ds["results_dir"], args.results_subdir)
@@ -153,13 +155,13 @@ class Bench:
 
     # ---------------------------------------------------------------- stages
     def stage_sweep(self):
-        grids = {"plaid": QUICK_PLAID if self.args.quick else PLAID_GRID,
-                 "ptms": QUICK_PLAID if self.args.quick else PLAID_GRID,
-                 "ragrt": QUICK_RAGRT if self.args.quick else RAGRT_GRID}
+        plaid_grid = QUICK_PLAID if self.args.quick else PLAID_GRID
+        ragrt_grid = QUICK_RAGRT if self.args.quick else RAGRT_GRID
+        grids = {"plaid": plaid_grid, "ptms": plaid_grid, "ragrt": ragrt_grid, "ragrt_bf": ragrt_grid}
         if PLAID_DEFAULT_K100 not in grids["plaid"]:
             grids["plaid"] = grids["plaid"] + [PLAID_DEFAULT_K100]
-        sweep = {}
-        for engine in ENGINES:
+        sweep = self.R.setdefault("sweep", {})
+        for engine in self.engines:
             pts = []
             t0 = time.time()
             for i, p in enumerate(grids[engine]):
@@ -175,7 +177,7 @@ class Bench:
             sweep[engine] = pts
             print(f"  swept {engine}: {len(pts)} configs on {len(self.tune):,} tune queries "
                   f"({time.time() - t0:.0f} s)", flush=True)
-        self.R["sweep"] = sweep
+            self.save()
 
     def stage_select(self):
         sweep = self.R["sweep"]
@@ -183,9 +185,10 @@ class Bench:
         targets = {f"gt_r10>={t:.2f}": t for t in self.args.targets}
         targets["plaid_default"] = default_pt["gt_r10"]
         sel = {}
+        swept = [e for e in ENGINES if e in sweep]
         for name, t in targets.items():
             sel[name] = {"target_gt_r10": t}
-            for engine in ENGINES:
+            for engine in swept:
                 pt = E.select_fastest_at(sweep[engine], t)
                 sel[name][engine] = None if pt is None else {"params": pt["params"], "key": pt["key"],
                                                              "tune_lat_median": pt["lat_median"],
@@ -193,7 +196,7 @@ class Bench:
         self.R["selection"] = sel
         # Primary point: PLAID's own k=100 default quality if every engine reaches it on TUNE,
         # else the highest target that all three reach (MS MARCO: RAGRT tops out just below it).
-        reached = [n for n, v in sel.items() if all(v[e] for e in ENGINES)]
+        reached = [n for n, v in sel.items() if all(v.get(e) for e in CORE)]
         if "plaid_default" in reached:
             primary = "plaid_default"
         elif reached:
@@ -204,14 +207,14 @@ class Bench:
         print(f"  primary operating point: {primary}")
         print("  operating points (fastest TUNE config reaching each target):")
         for name, s in sel.items():
-            row = "  ".join(f"{e}={s[e]['key'] if s[e] else 'unreachable'}" for e in ENGINES)
+            row = "  ".join(f"{e}={s[e]['key'] if s[e] else 'unreachable'}" for e in swept)
             print(f"    {name:<16} {row}")
 
-    def selected_configs(self):
+    def selected_configs(self, engines=None):
         seen = {}
         for s in self.R["selection"].values():
-            for engine in ENGINES:
-                if s[engine]:
+            for engine in (engines or self.engines):
+                if s.get(engine):
                     seen[(engine, s[engine]["key"])] = s[engine]["params"]
         return seen
 
@@ -230,11 +233,11 @@ class Bench:
         for name, s in self.R["selection"].items():
             c = {}
             for engine in ENGINES:
-                if s[engine]:
+                if s.get(engine) and f"{engine}|{s[engine]['key']}" in test:
                     c[engine] = test[f"{engine}|{s[engine]['key']}"]
             if "ragrt" in c:
                 rk = f"ragrt|{s['ragrt']['key']}"
-                for base in ("plaid", "ptms"):
+                for base in ("plaid", "ptms", "ragrt_bf"):
                     if base in c:
                         bk = f"{base}|{s[base]['key']}"
                         c[f"speedup_vs_{base}"] = c[base]["lat"]["median"] / c["ragrt"]["lat"]["median"]
@@ -246,12 +249,13 @@ class Bench:
 
     def primary(self):
         s = self.R["selection"][self.R["primary_target"]]
-        return {e: s[e]["params"] for e in ENGINES if s[e]}
+        return {e: s[e]["params"] for e in self.engines if s.get(e)}
 
     def stage_breakdown(self):
         P = self.primary()
         qids = self.test[:self.args.max_filter_queries]
-        out = {"stage0a_encode_median": self.R["stage0a_encode"]["median"]}
+        out = self.R.setdefault("breakdown", {})
+        out["stage0a_encode_median"] = self.R["stage0a_encode"]["median"]
         eng = self.eng
         if "plaid" in P:
             s13, tot = [], []
@@ -281,43 +285,48 @@ class Bench:
                 s13.append((t1 - t0) * 1000); s4.append((time.perf_counter() - t1) * 1000)
             out["ptms"] = {"s1_3": float(np.median(s13)), "s4": float(np.median(s4)),
                            "total": float(np.median(np.array(s13) + np.array(s4)))}
-        if "ragrt" in P:
-            st, tot = [], []
-            for q in qids[:WARMUP]:
-                eng.ragrt_profiled(*self.bank[q], P["ragrt"])
-            for q in qids:
-                torch.cuda.synchronize(); t0 = time.perf_counter()
-                _, s = eng.ragrt_profiled(*self.bank[q], P["ragrt"])
-                tot.append((time.perf_counter() - t0) * 1000)
-                st.append(s)
+        for e in RAGRT_ENGINES:
+            if e not in P:
+                continue
+            eng.stage1(e == "ragrt_bf")
+            try:
+                st, tot = [], []
+                for q in qids[:WARMUP]:
+                    eng.ragrt_profiled(*self.bank[q], P[e])
+                for q in qids:
+                    torch.cuda.synchronize(); t0 = time.perf_counter()
+                    _, s = eng.ragrt_profiled(*self.bank[q], P[e])
+                    tot.append((time.perf_counter() - t0) * 1000)
+                    st.append(s)
+            finally:
+                eng.stage1(False)
             st = np.array(st)
             names = ["s0b_prep", "s1_rt", "s2_gather", "s3_score", "s4_tms"]
-            out["ragrt"] = {n: float(np.median(st[:, i])) for i, n in enumerate(names)}
-            out["ragrt"]["total"] = float(np.median(tot))
-            out["ragrt"]["gpu_sum"] = float(np.median(st.sum(axis=1)))
-        self.R["breakdown"] = out
+            out[e] = {n: float(np.median(st[:, i])) for i, n in enumerate(names)}
+            out[e]["total"] = float(np.median(tot))
+            out[e]["gpu_sum"] = float(np.median(st.sum(axis=1)))
         print(f"  breakdown: {json.dumps(out)}", flush=True)
 
     def stage_filtered(self):
         P = self.primary()
         qids = self.test[:self.args.max_filter_queries]
         filts = [f for f in self.gt_names if f != "all"]
-        out = {}
+        out = self.R.setdefault("filtered", {})
         for f in filts:
-            out[f] = {}
+            out.setdefault(f, {})
             for engine, p in P.items():
                 res = self.evaluate(engine, p, qids, filt=f)
                 out[f][engine] = self.summarize(res)
             row = "  ".join(f"{e} {out[f][e]['lat']['median']:.2f}ms r10={out[f][e]['gt_r10']['mean']:.3f}"
                             for e in out[f])
             print(f"    filter {f:<10} {row}", flush=True)
-        self.R["filtered"] = out
 
     def stage_throughput(self):
         P = self.primary()
         qids = self.test[:self.args.throughput_queries]
         Qs = [self.bank[q] for q in qids]
-        out = {"n_queries": len(qids)}
+        out = self.R.setdefault("throughput", {})
+        out["n_queries"] = len(qids)
 
         def timed(fn):
             fn(Qs[:WARMUP])
@@ -325,32 +334,37 @@ class Bench:
             fn(Qs); torch.cuda.synchronize()
             return len(Qs) / (time.perf_counter() - t0)
 
-        for engine in ("plaid", "ptms", "ragrt"):
+        for engine in self.engines:
             if engine in P:
                 out[f"{engine}_sequential_qps"] = timed(
                     lambda batch, e=engine: [self.eng.search(e, Qf, n, P[e]) for Qf, n in batch])
-        if "ragrt" in P:
-            out["ragrt_pipelined_qps"] = {}
-            for B in BATCH_SIZES:
-                def run(batch, B=B):
-                    for a in range(0, len(batch), B):
-                        chunk = batch[a:a + B]
-                        self.eng.ragrt_pipelined([x[0] for x in chunk], [x[1] for x in chunk], P["ragrt"])
-                out["ragrt_pipelined_qps"][str(B)] = timed(run)
-        self.R["throughput"] = out
+        for e in RAGRT_ENGINES:
+            if e not in P:
+                continue
+            self.eng.stage1(e == "ragrt_bf")
+            try:
+                out[f"{e}_pipelined_qps"] = {}
+                for B in BATCH_SIZES:
+                    def run(batch, B=B, e=e):
+                        for a in range(0, len(batch), B):
+                            chunk = batch[a:a + B]
+                            self.eng.ragrt_pipelined([x[0] for x in chunk], [x[1] for x in chunk], P[e])
+                    out[f"{e}_pipelined_qps"][str(B)] = timed(run)
+            finally:
+                self.eng.stage1(False)
         print(f"  throughput: {json.dumps(out)}", flush=True)
 
     def stage_drops(self):
         qids = self.test[:self.args.max_filter_queries]
-        out = {}
+        out = self.R.setdefault("drops", {})
         rtrag_corr_3d.set_drop_stats(True)
         try:
             for (engine, key), p in self.selected_configs().items():
-                if engine != "ragrt":
+                if engine not in RAGRT_ENGINES:
                     continue
                 rtrag_corr_3d.reset_drop_stats()
                 for q in qids:
-                    self.eng.ragrt(*self.bank[q], p)
+                    self.eng.search(engine, *self.bank[q], p)
                 torch.cuda.synchronize()
                 s = dict(rtrag_corr_3d.get_drop_stats())
                 rays = max(s["rays"], 1)
@@ -358,12 +372,12 @@ class Bench:
                 s["frac_combos_found"] = s["combos_found"] / max(s["combos"], 1)
                 s["frac_tasks_dropped"] = s["tasks_dropped"] / max(s["tasks"], 1)
                 s["queries"] = len(qids)
-                out[key] = s
+                s["engine"] = engine
+                out[f"{engine}|{key}"] = s
                 print(f"    {key:<28} overflow rays {s['frac_rays_overflow']:.2%}  tasks dropped "
                       f"{s['frac_tasks_dropped']:.2%}  min-score drops {s['min_score_drops']:,}", flush=True)
         finally:
             rtrag_corr_3d.set_drop_stats(False)
-        self.R["drops"] = out
 
 
 def main():
@@ -377,6 +391,8 @@ def main():
     ap.add_argument("--throughput_queries", type=int, default=1024)
     ap.add_argument("--targets", type=lambda s: [float(x) for x in s.split(",")], default=[0.80, 0.85, 0.90, 0.95, 0.98])
     ap.add_argument("--quick", action="store_true", help="tiny grids, for a smoke test")
+    ap.add_argument("--engines", type=lambda s: s.split(","), default=ENGINES,
+                    help="subset to run (results merge into an existing results.json), e.g. ragrt_bf")
     ap.add_argument("--gt_path", default=None, help="ground truth file (default: the full one for the dataset)")
     ap.add_argument("--results_subdir", default=None, help="write results to <results>/<dataset>/<subdir> (e.g. smoke)")
     args = ap.parse_args()

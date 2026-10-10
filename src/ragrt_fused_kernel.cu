@@ -316,6 +316,71 @@ extern "C" void launch_mask_failing_candidates(
         d_cand_pids, n, d_doc_predicates, query_mask, d_scores);
 }
 
+// ---------------------------------------------------------------------------
+// Stage 1 WITHOUT RT cores (ablation): exact top-k codewords per (token, subspace)
+// on CUDA cores. One warp per logical ray (token-major: ray = token * 32 + subspace,
+// the same layout the OptiX raygen writes). Keeps only positive inner products, like
+// the any-hit shader, and writes the hits in the same buffers, so Stages 2-4 are
+// unchanged. Selection is exact: k rounds of a warp-wide argmax over all E codewords,
+// ordered by (value desc, index asc). Cost per ray: k * E / 32 three-term dots per lane.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ bool bf_before(float va, int ia, float vb, int ib) {
+    return (va > vb) || (va == vb && ia < ib);       // a ranks ahead of b
+}
+
+__global__ void bruteforce_stage1_kernel(
+    const float* __restrict__ q_points,               // [total_rays, 3]
+    const float* __restrict__ codewords,              // [32 * E, 3]
+    int total_rays, int E, int k, int max_hits,
+    int* __restrict__ out_c, float* __restrict__ out_v, int* __restrict__ out_n
+) {
+    int ray  = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+    if (ray >= total_rays) return;
+    int s = ray % NUM_3D_SUBSPACES;
+    float qx = q_points[3 * ray], qy = q_points[3 * ray + 1], qz = q_points[3 * ray + 2];
+    const float* cw = codewords + (size_t)3 * s * E;
+    if (k > max_hits) k = max_hits;
+
+    float last_v = INFINITY; int last_i = -1;
+    int nsel = 0;
+    for (int r = 0; r < k; ++r) {
+        float bv = -INFINITY; int bi = -1;
+        for (int e = lane; e < E; e += 32) {
+            float v = qx * cw[3 * e] + qy * cw[3 * e + 1] + qz * cw[3 * e + 2];
+            if (!(v > 0.0f)) continue;
+            if (!bf_before(last_v, last_i, v, e)) continue;   // already selected
+            if (bi < 0 || bf_before(v, e, bv, bi)) { bv = v; bi = e; }
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off /= 2) {
+            float ov = __shfl_down_sync(0xFFFFFFFF, bv, off);
+            int   oi = __shfl_down_sync(0xFFFFFFFF, bi, off);
+            if (oi >= 0 && (bi < 0 || bf_before(ov, oi, bv, bi))) { bv = ov; bi = oi; }
+        }
+        bv = __shfl_sync(0xFFFFFFFF, bv, 0);
+        bi = __shfl_sync(0xFFFFFFFF, bi, 0);
+        if (bi < 0) break;                              // no positive codewords left
+        if (lane == 0) {
+            out_c[(size_t)ray * max_hits + nsel] = bi;
+            out_v[(size_t)ray * max_hits + nsel] = bv;
+        }
+        last_v = bv; last_i = bi;
+        ++nsel;
+    }
+    if (lane == 0) out_n[ray] = nsel;
+}
+
+extern "C" void launch_bruteforce_stage1(
+    const float* d_q_points, const float* d_codewords, int total_rays, int E, int k, int max_hits,
+    int* d_out_c, float* d_out_v, int* d_out_n, cudaStream_t stream
+) {
+    int threads = 256;
+    int blocks = (total_rays * 32 + threads - 1) / threads;
+    bruteforce_stage1_kernel<<<blocks, threads, 0, stream>>>(
+        d_q_points, d_codewords, total_rays, E, k, max_hits, d_out_c, d_out_v, d_out_n);
+}
+
 static unsigned long long* g_d_stats = nullptr;
 static bool g_stats_enabled = false;
 

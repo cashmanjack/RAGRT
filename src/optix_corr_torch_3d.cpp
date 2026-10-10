@@ -49,6 +49,9 @@ extern "C" int   ragrt_dropped_task_count(int buf_idx);
 extern "C" void  launch_mask_failing_candidates(const int* d_cand_pids, int n, const uint32_t* d_doc_predicates,
                                                 uint32_t query_mask, float* d_scores, cudaStream_t stream);
 extern "C" void  ragrt_set_drop_stats(int enabled);
+extern "C" void  launch_bruteforce_stage1(const float* d_q_points, const float* d_codewords, int total_rays,
+                                          int E, int k, int max_hits, int* d_out_c, float* d_out_v,
+                                          int* d_out_n, cudaStream_t stream);
 extern "C" void  ragrt_reset_drop_stats();
 extern "C" void  ragrt_drop_stats(unsigned long long* out);
 static const char* DROP_STAT_NAMES[] = {
@@ -104,6 +107,7 @@ public:
     cudaEvent_t event_tms_done[2];
 
     bool is_bound = false;
+    int stage1_mode = 0;   // 0: OptiX RT cores, 1: brute force on CUDA cores (ablation)
     torch::Tensor b_csr_row_ptrs, b_csr_col_eids, b_csr_block_sums, b_csr_lengths, b_map_packed;
     torch::Tensor b_doc_offsets, b_doc_lens, b_codes, b_residuals;
     torch::Tensor b_centroids_128, b_bucket_weights, b_reversed_bit_map, b_decomp_table;
@@ -164,6 +168,23 @@ public:
         for (int b = 0; b < 2; ++b) {
             if (event_cand_ready[b]) cudaEventDestroy(event_cand_ready[b]);
             if (event_tms_done[b]) cudaEventDestroy(event_tms_done[b]);
+        }
+    }
+
+    void set_stage1_mode(int mode) {
+        TORCH_CHECK(mode == 0 || mode == 1, "stage1 mode must be 0 (RT) or 1 (brute force)");
+        stage1_mode = mode;
+    }
+
+    // Stage 1 for the single-query paths, on the legacy default stream.
+    void stage1(const CorrParams3D& p, const torch::Tensor& qp, int total_rays, int k_eids, cudaStream_t stream) {
+        if (stage1_mode == 0) {
+            CUDA_CHECK(cudaMemcpy(d_p_single, &p, sizeof(CorrParams3D), cudaMemcpyHostToDevice));
+            OPTIX_CHECK(optixLaunch(pipe, stream, (CUdeviceptr)d_p_single, sizeof(CorrParams3D), &sbt, total_rays, 1, 1));
+        } else {
+            launch_bruteforce_stage1(qp.data_ptr<float>(), (const float*)d_centroid_xyz, total_rays,
+                                     NUM_FINE_PER_SUBSPACE, k_eids, p.max_hits,
+                                     p.out_hit_centroid, p.out_hit_value, p.out_hit_count, stream);
         }
     }
 
@@ -320,8 +341,7 @@ public:
         p.out_hit_count = buf_out_n[0].data_ptr<int>();
         p.max_hits = 128;
 
-        CUDA_CHECK(cudaMemcpy(d_p_single, &p, sizeof(CorrParams3D), cudaMemcpyHostToDevice));
-        OPTIX_CHECK(optixLaunch(pipe, nullptr, (CUdeviceptr)d_p_single, sizeof(CorrParams3D), &sbt, total_rays, 1, 1));
+        stage1(p, qp, total_rays, k_eids, 0);
 
         d_passage_scores[0].zero_();
 
@@ -388,8 +408,7 @@ public:
         cudaEventCreate(&ev3); cudaEventCreate(&ev4);
 
         cudaEventRecord(ev0, 0);
-        CUDA_CHECK(cudaMemcpy(d_p_single, &p, sizeof(CorrParams3D), cudaMemcpyHostToDevice));
-        OPTIX_CHECK(optixLaunch(pipe, nullptr, (CUdeviceptr)d_p_single, sizeof(CorrParams3D), &sbt, total_rays, 1, 1));
+        stage1(p, qp, total_rays, k_eids, 0);
         cudaEventRecord(ev1, 0);
 
         launch_ragrt_stage2_only(
@@ -494,7 +513,14 @@ public:
             {
                 c10::cuda::CUDAStreamGuard guard(c_stream_cand);
                 buf_out_c[buf_idx].zero_(); buf_out_v[buf_idx].zero_(); buf_out_n[buf_idx].zero_();
-                OPTIX_CHECK(optixLaunch(pipe, stream_cand, param_ptr, sizeof(CorrParams3D), &sbt, total_rays, 1, 1));
+                if (stage1_mode == 0) {
+                    OPTIX_CHECK(optixLaunch(pipe, stream_cand, param_ptr, sizeof(CorrParams3D), &sbt, total_rays, 1, 1));
+                } else {
+                    launch_bruteforce_stage1(Q_sub3d_list[i].data_ptr<float>(), (const float*)d_centroid_xyz,
+                        total_rays, NUM_FINE_PER_SUBSPACE, k_eids, 128,
+                        buf_out_c[buf_idx].data_ptr<int>(), buf_out_v[buf_idx].data_ptr<float>(),
+                        buf_out_n[buf_idx].data_ptr<int>(), stream_cand);
+                }
                 d_passage_scores[buf_idx].zero_();
 
                 launch_ragrt_fused_stage23_csr256(
@@ -558,11 +584,29 @@ torch::Tensor native_tile_maxsim_fused_decomp(
     return out_scores;
 }
 
+// Standalone entry point for testing the brute-force Stage 1 against torch (tests/test_stage1_gpu.py).
+std::vector<torch::Tensor> bruteforce_stage1_standalone(torch::Tensor q_points, torch::Tensor codewords, int64_t k, int64_t max_hits) {
+    TORCH_CHECK(q_points.is_cuda() && q_points.scalar_type() == torch::kFloat32 && q_points.dim() == 2 && q_points.size(1) == 3);
+    TORCH_CHECK(codewords.is_cuda() && codewords.scalar_type() == torch::kFloat32 && codewords.dim() == 2 && codewords.size(1) == 3);
+    TORCH_CHECK(codewords.size(0) % NUM_3D_SUBSPACES == 0, "codewords must be [32 * E, 3]");
+    auto q = q_points.contiguous(); auto cw = codewords.contiguous();
+    int R = (int)q.size(0), E = (int)(cw.size(0) / NUM_3D_SUBSPACES);
+    auto oi = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    auto out_c = torch::full({R, max_hits}, -1, oi);
+    auto out_v = torch::zeros({R, max_hits}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    auto out_n = torch::zeros({R}, oi);
+    launch_bruteforce_stage1(q.data_ptr<float>(), cw.data_ptr<float>(), R, E, (int)k, (int)max_hits,
+                             out_c.data_ptr<int>(), out_v.data_ptr<float>(), out_n.data_ptr<int>(), 0);
+    return {out_c, out_v, out_n};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     pybind11::class_<CorrIndex3D>(m, "CorrIndex3D")
         .def(pybind11::init<std::string>(), pybind11::arg("ptx_path"))
         .def("build", &CorrIndex3D::build, pybind11::arg("codebooks"), pybind11::arg("base_radius") = 0.95, pybind11::arg("num_tris") = 4)
         .def("bind_index", &CorrIndex3D::bind_index)
+        .def("set_stage1_mode", &CorrIndex3D::set_stage1_mode, pybind11::arg("mode"),
+             "0 = OptiX RT cores (default), 1 = brute-force exact top-k on CUDA cores (ablation)")
         .def("search_single_query_profiled", &CorrIndex3D::search_single_query_profiled,
              pybind11::arg("Q_full_128_fp32"), pybind11::arg("Q_full_fp16"), pybind11::arg("Q_sub3d"), pybind11::arg("topc"), pybind11::arg("scores"),
              pybind11::arg("k_cent"), pybind11::arg("k_candidates"), pybind11::arg("k_top"), pybind11::arg("query_mask") = 0, pybind11::arg("k_eids") = 16)     
@@ -573,6 +617,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              pybind11::arg("Q_full_128_list"), pybind11::arg("Q_full_fp16_list"), pybind11::arg("Q_sub3d_list"), pybind11::arg("topc_list"), pybind11::arg("scores_list"),
              pybind11::arg("k_cent"), pybind11::arg("k_candidates"), pybind11::arg("k_top"), pybind11::arg("query_mask") = 0, pybind11::arg("k_eids") = 16);
     m.def("native_tile_maxsim_fused_decomp", &native_tile_maxsim_fused_decomp);
+    m.def("bruteforce_stage1", &bruteforce_stage1_standalone,
+          "Exact top-k positive codewords per ray on CUDA cores: (q [R,3], codewords [32*E,3], k, max_hits) -> (ids, vals, counts)");
     m.def("set_drop_stats", [](bool enabled) { ragrt_set_drop_stats(enabled ? 1 : 0); },
           "Enable/disable the Stage-2 diagnostic counters (off by default; leave off for timing).");
     m.def("reset_drop_stats", []() { ragrt_reset_drop_stats(); });
