@@ -20,7 +20,7 @@ Requires run_benchmarks.py stages select + test (for the operating point and TES
 
   python3 profile_dram.py --dataset msmarco [--n 50]
 """
-import os, sys, json, shutil, argparse, subprocess
+import os, sys, json, time, shutil, argparse, subprocess
 
 import eval_config as C
 import eval_lib as E
@@ -85,13 +85,20 @@ def driver(args):
                    "--cache-control", mode,
                    sys.executable, os.path.abspath(__file__), "--worker", "--range", rng,
                    "--dataset", args.dataset, "--n", str(args.n)]
-            print(f"  ncu [{mode}] {rng} ...", flush=True)
-            p = subprocess.run(cmd, cwd=C.BASE_DIR, capture_output=True, text=True)
-            if p.returncode != 0:
-                tail = (p.stderr or p.stdout)[-2000:]
-                sys.exit(f"FATAL: ncu failed for {rng} ({mode}).\n{tail}\n"
+            log = os.path.join(ds["results_dir"], f"ncu_{mode}_{rng}.log")
+            print(f"  ncu [{mode}] {rng}  (log: {log})", flush=True)
+            t0 = time.time()
+            with open(log, "w") as fh:
+                proc = subprocess.Popen(cmd, cwd=C.BASE_DIR, stdout=fh, stderr=subprocess.STDOUT, text=True)
+                while proc.poll() is None:
+                    time.sleep(30)
+                    n = sum(1 for l in open(log, errors="ignore") if l.startswith("==PROF== Profiling"))
+                    print(f"    {time.time() - t0:5.0f} s, {n} kernels profiled", flush=True)
+            text = open(log, errors="ignore").read()
+            if proc.returncode != 0:
+                sys.exit(f"FATAL: ncu failed for {rng} ({mode}).\n{text[-2000:]}\n"
                          "If this mentions ERR_NVGPUCTRPERM, GPU counters are restricted to admins on this machine.")
-            totals, nk = E.parse_ncu_csv(p.stdout, METRICS)
+            totals, nk = E.parse_ncu_csv(text, METRICS)
             if nk == 0:
                 sys.exit(f"FATAL: ncu profiled no kernels in dram_{rng}; check the NVTX range name.")
             res[rng] = {"read_bytes": totals[METRICS[0]], "write_bytes": totals[METRICS[1]], "kernels": nk}
@@ -114,7 +121,7 @@ def driver(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", required=True, choices=list(C.DATASETS))
-    ap.add_argument("--n", type=int, default=50, help="TEST queries per engine")
+    ap.add_argument("--n", type=int, default=10, help="TEST queries per engine (ncu serializes every kernel: keep small)")
     ap.add_argument("--ncu", default=None)
     ap.add_argument("--worker", action="store_true")
     ap.add_argument("--range", choices=RANGES)

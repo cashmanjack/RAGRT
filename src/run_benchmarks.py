@@ -38,11 +38,11 @@ ENGINES = ["plaid", "ptms", "ragrt"]
 PLAID_DEFAULT_K100 = {"ncells": 2, "threshold": 0.45, "ndocs": 1024}   # ColBERT Searcher defaults for k=100
 
 PLAID_GRID = [{"ncells": n, "threshold": t, "ndocs": d}
-              for n in [1, 2, 4, 8] for t in [0.3, 0.4, 0.45, 0.5, 0.6]
-              for d in [128, 256, 512, 1024, 2048, 4096, 8192]]
+              for n in [1, 2, 4, 8] for t in [0.3, 0.4, 0.45, 0.5, 0.6, 0.7]
+              for d in [64, 128, 256, 512, 1024, 2048, 4096, 8192]]
 RAGRT_GRID = [{"nc": n, "eids": e, "ndocs": d}
-              for n in [8, 16, 32, 64] for e in [1, 2, 4, 8, 16, 32]
-              for d in [512, 1024, 2048, 4096, 8192, 16384, 32768]]
+              for n in [4, 8, 16, 32, 64] for e in [4, 8, 16, 32, 64]
+              for d in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]]   # eids <= 64 (kernel s_top size)
 QUICK_PLAID = [PLAID_DEFAULT_K100, {"ncells": 1, "threshold": 0.5, "ndocs": 256}]
 QUICK_RAGRT = [{"nc": 32, "eids": 16, "ndocs": 4096}, {"nc": 16, "eids": 32, "ndocs": 16384}]
 BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
@@ -191,7 +191,17 @@ class Bench:
                                                              "tune_lat_median": pt["lat_median"],
                                                              "tune_gt_r10": pt["gt_r10"]}
         self.R["selection"] = sel
-        self.R["primary_target"] = "plaid_default"
+        # Primary point: PLAID's own k=100 default quality if every engine reaches it on TUNE,
+        # else the highest target that all three reach (MS MARCO: RAGRT tops out just below it).
+        reached = [n for n, v in sel.items() if all(v[e] for e in ENGINES)]
+        if "plaid_default" in reached:
+            primary = "plaid_default"
+        elif reached:
+            primary = max(reached, key=lambda n: sel[n]["target_gt_r10"])
+        else:
+            sys.exit("FATAL: no quality target is reached by all engines on TUNE; widen the grids.")
+        self.R["primary_target"] = primary
+        print(f"  primary operating point: {primary}")
         print("  operating points (fastest TUNE config reaching each target):")
         for name, s in sel.items():
             row = "  ".join(f"{e}={s[e]['key'] if s[e] else 'unreachable'}" for e in ENGINES)
